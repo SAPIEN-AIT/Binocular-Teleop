@@ -35,8 +35,11 @@ MIDDLE_MCP  = 9; MIDDLE_PIP   = 10; MIDDLE_DIP = 11; MIDDLE_TIP = 12
 RING_MCP    = 13; RING_PIP    = 14; RING_DIP   = 15; RING_TIP   = 16
 
 # ── Tuning ─────────────────────────────────────────────────────────────────────
-# Maximum observed bend angle in MediaPipe 3-D (≈ 130-135°, clamp generously)
-_MP_MAX = 2.3   # radians
+# Maximum inter-bone angle MediaPipe actually produces at a fully-curled joint.
+# With model_complexity=1 the observable max is ~1.8 rad (≈103°).
+# Too high → fingers never reach full closure in sim.
+# Too low  → joints saturate before you fully curl.
+_MP_MAX = 1.8   # radians  (was 2.3 — too generous, prevented full closure)
 
 # Practical LEAP upper limits (slightly below XML max to stay away from limits)
 _MCP_MAX  = 2.0   # LEAP xml max 2.23
@@ -127,8 +130,11 @@ class IKRetargeter:
         idd = _lm3(lm, INDEX_DIP);  it  = _lm3(lm, INDEX_TIP)
 
         q[0] = _scale(_bend(im - w,   ip  - im), _MCP_MAX)   # if_mcp
-        # rot: index spreads laterally away from middle (left in image = positive rot)
-        spread_i = float(np.clip((im[0] - mm[0]) * 8.0, -_ROT_LIM, _ROT_LIM))
+        # rot: index spreads laterally away from middle.
+        # Normalize by wrist→middle-MCP distance so the value is scale-invariant
+        # (hand at different distances from the camera gives the same spread angle).
+        hand_scale = float(np.linalg.norm((mm - w)[:2])) + 1e-6
+        spread_i = float(np.clip((im[0] - mm[0]) / hand_scale * 1.5, -_ROT_LIM, _ROT_LIM))
         q[1] = spread_i                                        # if_rot
         q[2] = _scale(_bend(ip - im,  idd - ip),  _PIP_MAX)   # if_pip
         q[3] = _scale(_bend(idd - ip, it  - idd), _DIP_MAX)   # if_dip
@@ -147,7 +153,7 @@ class IKRetargeter:
         rd  = _lm3(lm, RING_DIP);  rt  = _lm3(lm, RING_TIP)
 
         q[8]  = _scale(_bend(rm - w,  rp - rm), _MCP_MAX)     # rf_mcp
-        spread_r = float(np.clip((mm[0] - rm[0]) * 8.0, -_ROT_LIM, _ROT_LIM))
+        spread_r = float(np.clip((mm[0] - rm[0]) / hand_scale * 1.5, -_ROT_LIM, _ROT_LIM))
         q[9]  = spread_r                                       # rf_rot
         q[10] = _scale(_bend(rp - rm, rd - rp), _PIP_MAX)     # rf_pip
         q[11] = _scale(_bend(rd - rp, rt - rd), _DIP_MAX)     # rf_dip
@@ -161,9 +167,9 @@ class IKRetargeter:
         # th_cmc: metacarpal curl — how far thumb rises from palm
         q[12] = _scale(_bend(tc - w,  tm - tc),  _CMC_MAX)    # th_cmc
 
-        # th_axl: opposition — how much thumb tip crosses toward index
-        # When thumb tip is to the LEFT of the index MCP (x smaller), it opposes
-        opposition = float(np.clip((im[0] - tt[0]) * 6.0, 0.0, 1.0))
+        # th_axl: opposition — how much thumb tip crosses toward the index side.
+        # Normalize by hand_scale so opposition doesn't vanish as hand moves closer.
+        opposition = float(np.clip((im[0] - tt[0]) / hand_scale * 1.2, 0.0, 1.0))
         q[13] = opposition * _AXL_MAX                          # th_axl
 
         q[14] = _scale(_bend(tm - tc,  tip - tm), _TMCP_MAX)  # th_mcp

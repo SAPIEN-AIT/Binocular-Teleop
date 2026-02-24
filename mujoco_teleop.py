@@ -52,10 +52,12 @@ POS_FREQ     = 30.0
 POS_MC       = 0.8
 POS_BETA     = 0.005
 
-# Workspace mapping — lateral/vertical
-# Image coords are normalised [0,1]; scale controls how far the sim hand moves.
-X_SCALE      = 0.3     # lateral range  (m) — sim x
-Z_SCALE      = 0.3     # vertical range (m) — sim z
+# Workspace mapping
+# In the new pinhole back-projection model the workspace scales automatically
+# with depth (back_project returns real metres).  X_SCALE / Z_SCALE are kept
+# here as legacy references but are no longer applied to the position output.
+X_SCALE      = 0.3     # legacy — no longer used
+Z_SCALE      = 0.3     # legacy — no longer used
 
 # Depth (stereo Z) → sim Y — only used when STEREO_DEPTH = True
 DEPTH_MIN_M  = 0.20
@@ -121,7 +123,7 @@ def _update(data:    mujoco.MjData,
     h, w, _ = frame_l.shape
 
     if STEREO_DEPTH:
-        # ── Stereo path — requires both cameras ──────────────────────────────
+        # ── Stereo path — full pinhole back-projection ────────────────────────
         res_l, res_r = tracker.process(frame_l, frame_r)
 
         if not (res_l.multi_hand_landmarks and res_r.multi_hand_landmarks):
@@ -131,7 +133,7 @@ def _update(data:    mujoco.MjData,
         lm_l = res_l.multi_hand_landmarks[0].landmark
         lm_r = res_r.multi_hand_landmarks[0].landmark
 
-        # Epipolar check
+        # Epipolar check (Y_OFFSET_PX correction already baked into frames)
         py_l = int(lm_l[0].y * h)
         py_r = int(lm_r[0].y * h)
         valid, epi_err = geo.check_epipolar_constraint(py_l, py_r,
@@ -143,20 +145,31 @@ def _update(data:    mujoco.MjData,
             _show(frame_l)
             return
 
-        # Triangulated depth
-        px_l = int(lm_l[0].x * w)
-        px_r = int(lm_r[0].x * w)
-        z_cm = geo.triangulate_depth(px_l, px_r)
-        if z_cm is not None and z_cm > 0:
-            depth_m = float(np.clip(z_cm / 100.0, DEPTH_MIN_M, DEPTH_MAX_M))
-        else:
-            depth_m = DEPTH_MID_M
+        # Full 3-D hand position via pinhole back-projection:
+        #   1. Median depth over 4 anchor landmarks (wrist + 3 MCPs) → robust Z
+        #   2. Back-project wrist pixel with principal-point correction → (X,Y,Z)
+        p3d = geo.stereo_hand_3d(lm_l, lm_r, w, h,
+                                  depth_min_m=DEPTH_MIN_M,
+                                  depth_max_m=DEPTH_MAX_M)
+        if p3d is None:
+            # All disparities zero/negative — bad stereo frame, skip
+            _show(frame_l)
+            return
 
-        sim_y = START_Y + (DEPTH_MID_M - depth_m) * DEPTH_SCALE
+        x_m, y_m, z_m = p3d   # X: right+, Y: down+, Z: forward+
+
+        # Camera frame → sim frame:
+        #   sim_x: mirror camera X  (your right = sim +x)
+        #   sim_y: camera Z maps to forward depth, offset from neutral
+        #   sim_z: invert camera Y  (camera down = sim up)
+        sim_x = -x_m
+        sim_y =  START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE
+        sim_z =  START_Z - y_m
 
         if SHOW_CAMERA:
-            cv2.putText(frame_l, f"Depth {depth_m*100:.1f} cm  epi={epi_err:.0f}px",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
+            cv2.putText(frame_l,
+                        f"Z={z_m*100:.0f}cm  X={x_m*100:+.0f}cm  epi={epi_err:.0f}px",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
 
     else:
         # ── Monocular path — left frame only ─────────────────────────────────
@@ -169,19 +182,24 @@ def _update(data:    mujoco.MjData,
             _show(frame_l)
             return
 
-        lm_l    = res_l.multi_hand_landmarks[0].landmark
-        sim_y   = START_Y   # depth fixed until stereo is re-enabled
+        lm_l = res_l.multi_hand_landmarks[0].landmark
+
+        # Principal-point-corrected lateral/vertical.
+        # Equivalent to back_project at a fixed assumed depth of START_Y metres.
+        # Removes the image-centre bias in the old (lm.x - 0.5) formula.
+        cam   = geo.ZED2I
+        u_w   = lm_l[0].x * w
+        v_w   = lm_l[0].y * h
+        sim_x = -(u_w - cam.cx) / cam.fx * START_Y
+        sim_y =  START_Y
+        sim_z =  START_Z - (v_w - cam.cy) / cam.fy * START_Y
 
         if SHOW_CAMERA:
             cv2.putText(frame_l, "Monocular IK", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2)
 
     # ── Mocap position ────────────────────────────────────────────────────────
-    raw_pos = np.array([
-        -(lm_l[0].x - 0.5) * X_SCALE,   # image x → sim x (mirrored)
-        sim_y,                            # fixed or triangulated
-        START_Z + (0.5 - lm_l[0].y) * Z_SCALE,  # image y → sim z (inverted)
-    ])
+    raw_pos = np.array([sim_x, sim_y, sim_z])
     data.mocap_pos[mid] = pos_f(raw_pos)
 
     # ── Direct angle retargeting ──────────────────────────────────────────────
