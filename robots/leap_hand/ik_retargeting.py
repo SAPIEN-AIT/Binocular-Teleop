@@ -26,7 +26,10 @@ RING  : MCP=13 PIP=14 DIP=15 TIP=16
 
 import numpy as np
 import mujoco
-
+# ── Debug flag ─────────────────────────────────────────────────────────────────────
+# Set True to print the running-max bend angle seen at each joint.
+# Run with a tight fist — the printed peak is your real _MP_MAX.
+DEBUG_ANGLES = False
 # ── MediaPipe landmark indices ─────────────────────────────────────────────────
 WRIST       = 0
 THUMB_CMC   = 1; THUMB_MCP_LM = 2; THUMB_IP = 3; THUMB_TIP = 4
@@ -80,6 +83,78 @@ def _scale(angle: float, leap_max: float) -> float:
     return float(np.clip(angle / _MP_MAX * leap_max, 0.0, leap_max))
 
 
+def _rot_to_quat(R: np.ndarray) -> np.ndarray:
+    """
+    3×3 rotation matrix → quaternion (w, x, y, z) — MuJoCo convention.
+    Numerically stable Shepperd method.
+    """
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        return np.array([0.25 / s,
+                         (R[2, 1] - R[1, 2]) * s,
+                         (R[0, 2] - R[2, 0]) * s,
+                         (R[1, 0] - R[0, 1]) * s])
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        return np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s,
+                         (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        return np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                         0.25 * s,                 (R[1, 2] + R[2, 1]) / s])
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        return np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                         (R[1, 2] + R[2, 1]) / s, 0.25 * s])
+
+
+def palm_quat(lm) -> np.ndarray:
+    """
+    Compute the LEAP palm orientation as a MuJoCo quaternion (w, x, y, z)
+    from MediaPipe landmarks.
+
+    Palm frame (in MediaPipe camera space):
+      long_axis : WRIST → MIDDLE_MCP          (finger direction)
+      lat_axis  : INDEX_MCP → RING_MCP         (across knuckles)
+      normal    : cross(lat_axis, long_axis)   (palm-outward normal)
+
+    Camera → MuJoCo frame conversion:
+      cam X (right)   → muj X (right)      [ no change ]
+      cam Z (forward) → muj Y (forward)    [ swap ]
+      cam Y (down)    → -muj Z (up)        [ invert + swap ]
+    """
+    w_lm = _lm3(lm, WRIST)
+    imcp = _lm3(lm, INDEX_MCP)
+    mmcp = _lm3(lm, MIDDLE_MCP)
+    rmcp = _lm3(lm, RING_MCP)
+
+    # Palm basis vectors in MediaPipe (camera) space
+    long_v = mmcp - w_lm                            # wrist → middle MCP
+    lat_v  = rmcp - imcp                            # index MCP → ring MCP
+    norm_v = np.cross(lat_v, long_v)               # palm outward normal
+
+    # Orthonormalise (Gram-Schmidt)
+    long_v = long_v / (np.linalg.norm(long_v) + 1e-6)
+    norm_v = norm_v / (np.linalg.norm(norm_v) + 1e-6)
+    lat_v  = np.cross(long_v, norm_v)
+    lat_v  = lat_v  / (np.linalg.norm(lat_v)  + 1e-6)
+
+    # Rotation matrix in camera frame: columns = [lat, long, normal]
+    R_cam = np.column_stack([lat_v, long_v, norm_v])
+
+    # Camera → MuJoCo frame change-of-basis:
+    #   muj_x =  cam_x   (col 0 unchanged)
+    #   muj_y =  cam_z   (col 2 → col 1)
+    #   muj_z = -cam_y   (col 1 → col 2, negated)
+    T = np.array([[1,  0,  0],
+                  [0,  0,  1],
+                  [0, -1,  0]], dtype=float)
+    R_muj = T @ R_cam
+
+    return _rot_to_quat(R_muj)
+
+
 # ── Main class ─────────────────────────────────────────────────────────────────
 class IKRetargeter:
     """
@@ -97,7 +172,11 @@ class IKRetargeter:
     def __init__(self, model: mujoco.MjModel,
                  n_iters: int = 15,   # kept for API compat (unused)
                  step: float  = 0.5): # kept for API compat (unused)
-        self.model = model
+        self.model    = model
+        # Running-max angles for each bend joint (used by DEBUG_ANGLES).
+        # Order: [if_mcp, if_pip, if_dip, mf_mcp, mf_pip, mf_dip,
+        #         rf_mcp, rf_pip, rf_dip, th_cmc, th_mcp, th_ipl]
+        self._angle_max = np.zeros(12)
 
     # ------------------------------------------------------------------
     def retarget(self,
@@ -115,10 +194,10 @@ class IKRetargeter:
 
         Returns:
             q (16,): desired joint angles in LEAP actuator order
-                     [if_mcp, if_rot, if_pip, if_dip,
-                      mf_mcp, mf_rot, mf_pip, mf_dip,
-                      rf_mcp, rf_rot, rf_pip, rf_dip,
-                      th_cmc, th_axl, th_mcp, th_ipl]
+                    [if_mcp, if_rot, if_pip, if_dip,
+                    mf_mcp, mf_rot, mf_pip, mf_dip,
+                    rf_mcp, rf_rot, rf_pip, rf_dip,
+                    th_cmc, th_axl, th_mcp, th_ipl]
         """
         q = np.zeros(16)
 
@@ -144,7 +223,12 @@ class IKRetargeter:
         mdi = _lm3(lm, MIDDLE_DIP); mti = _lm3(lm, MIDDLE_TIP)
 
         q[4] = _scale(_bend(mmp - w,   mpi - mmp), _MCP_MAX)  # mf_mcp
-        q[5] = 0.0                                             # mf_rot (centred)
+        # mf_rot: middle deviates from the midpoint between index and ring MCPs.
+        # If middle is to the right of that midpoint → positive (spans toward ring).
+        mid_ref_x = (im[0] + _lm3(lm, RING_MCP)[0]) * 0.5
+        spread_m = float(np.clip((mid_ref_x - mm[0]) / hand_scale * 1.0,
+                                  -_ROT_LIM, _ROT_LIM))
+        q[5] = spread_m                                        # mf_rot
         q[6] = _scale(_bend(mpi - mmp, mdi - mpi), _PIP_MAX)  # mf_pip
         q[7] = _scale(_bend(mdi - mpi, mti - mdi), _DIP_MAX)  # mf_dip
 
@@ -174,5 +258,29 @@ class IKRetargeter:
 
         q[14] = _scale(_bend(tm - tc,  tip - tm), _TMCP_MAX)  # th_mcp
         q[15] = _scale(_bend(tip - tm, tt - tip), _IPL_MAX)   # th_ipl
+
+        if DEBUG_ANGLES:
+            raw = np.array([
+                _bend(im - w,   ip  - im),   # if_mcp
+                _bend(ip - im,  idd - ip),   # if_pip
+                _bend(idd - ip, it  - idd),  # if_dip
+                _bend(mmp - w,  mpi - mmp),  # mf_mcp
+                _bend(mpi - mmp, mdi - mpi), # mf_pip
+                _bend(mdi - mpi, mti - mdi), # mf_dip
+                _bend(rm - w,   rp  - rm),   # rf_mcp
+                _bend(rp - rm,  rd  - rp),   # rf_pip
+                _bend(rd - rp,  rt  - rd),   # rf_dip
+                _bend(tc - w,   tm  - tc),   # th_cmc
+                _bend(tm - tc,  tip - tm),   # th_mcp
+                _bend(tip - tm, tt  - tip),  # th_ipl
+            ])
+            self._angle_max = np.maximum(self._angle_max, raw)
+            names = ['if_mcp','if_pip','if_dip',
+                     'mf_mcp','mf_pip','mf_dip',
+                     'rf_mcp','rf_pip','rf_dip',
+                     'th_cmc','th_mcp','th_ipl']
+            parts = [f"{n}={v:.2f}(max={m:.2f})"
+                     for n, v, m in zip(names, raw, self._angle_max)]
+            print("ANGLES  " + "  ".join(parts))
 
         return q

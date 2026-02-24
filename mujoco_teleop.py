@@ -28,11 +28,11 @@ import mujoco
 import mujoco.viewer
 import cv2
 
-from binocular.camera        import ZEDCamera
-from binocular.detectors     import StereoHandTracker
-import binocular.geometry    as geo
-from binocular.smoother      import OneEuroFilter
-from binocular.ik_retargeting import IKRetargeter
+from binocular.camera                    import ZEDCamera
+from binocular.detectors                 import StereoHandTracker
+import binocular.geometry                as geo
+from binocular.smoother                  import OneEuroFilter
+from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 0       # ZED device index (try 0 if 1 fails)
@@ -70,9 +70,48 @@ START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 # Epipolar constraint — only checked when STEREO_DEPTH = True
 EPIPOLAR_TOL = 5       # px (tight, since Y_OFFSET_PX corrects the 30 px bias)
 
+# ── Wrist orientation ─────────────────────────────────────────────────────────────────────
+# Disabled while tuning finger IK — enable once fingers track correctly.
+# When True, rotate ORIENT_OFFSET until the sim palm matches your real palm at rest.
+WRIST_ORIENT  = False  # drive mocap_quat from palm normal; False = locked identity
+
+# One Euro Filter for quaternion (4-dim)
+ORIENT_FREQ   = 30.0
+ORIENT_MC     = 1.5    # higher than pos — rotations need faster response
+ORIENT_BETA   = 0.05
+
+# Static rotation applied AFTER the MediaPipe-derived quaternion.
+# Compensates for the LEAP hand's rest orientation in the XML.
+# Tune until the sim palm matches your real palm when flat facing the camera.
+# Format: (w, x, y, z).  Identity = no offset.
+ORIENT_OFFSET = np.array([1.0, 0.0, 0.0, 0.0])
+
+# ── Handedness filter ─────────────────────────────────────────────────────────────────────
+# ZED is a non-mirrored camera: your RIGHT hand appears on the LEFT side of the
+# image, so MediaPipe labels it "Left".  Flip to "Right" if using a mirrored cam.
+TARGET_HAND   = "Left"   # tracks your physical right hand on a non-mirrored ZED
+
 # cv2.imshow conflicts with mjpython's Cocoa event loop on macOS.
 # Set to True only when running with plain `python` (not `mjpython`).
 SHOW_CAMERA  = False
+
+# ── Quaternion helpers ────────────────────────────────────────────────────────
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+    ])
+
+
+def _quat_ensure_hemi(q: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Negate q if it is in the opposite hemisphere from ref (avoids filter flips)."""
+    return -q if np.dot(q, ref) < 0 else q
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DIR       = os.path.dirname(os.path.abspath(__file__))
@@ -103,13 +142,14 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData):
     mujoco.mj_forward(model, data)
 
 
-def _update(data:    mujoco.MjData,
-            zed:     ZEDCamera,
-            tracker: StereoHandTracker,
-            ik:      IKRetargeter,
-            pos_f:   OneEuroFilter,
-            joint_f: OneEuroFilter,
-            mid:     int) -> None:
+def _update(data:     mujoco.MjData,
+            zed:      ZEDCamera,
+            tracker:  StereoHandTracker,
+            ik:       IKRetargeter,
+            pos_f:    OneEuroFilter,
+            joint_f:  OneEuroFilter,
+            orient_f: OneEuroFilter,
+            mid:      int) -> None:
     """
     Single-frame update: capture → detect → retarget → actuate.
 
@@ -182,6 +222,15 @@ def _update(data:    mujoco.MjData,
             _show(frame_l)
             return
 
+        # Reject if the detected hand is not the target hand (avoids mirrored joints).
+        label = res_l.multi_handedness[0].classification[0].label  # "Left" or "Right"
+        if label != TARGET_HAND:
+            if SHOW_CAMERA:
+                cv2.putText(frame_l, f"{label} hand ignored", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+            _show(frame_l)
+            return
+
         lm_l = res_l.multi_hand_landmarks[0].landmark
 
         # Principal-point-corrected lateral/vertical.
@@ -201,7 +250,18 @@ def _update(data:    mujoco.MjData,
     # ── Mocap position ────────────────────────────────────────────────────────
     raw_pos = np.array([sim_x, sim_y, sim_z])
     data.mocap_pos[mid] = pos_f(raw_pos)
-
+    # ── Wrist orientation ───────────────────────────────────────────────────────────────────
+    if WRIST_ORIENT:
+        raw_q = palm_quat(lm_l)
+        # Ensure quaternion stays in the same hemisphere as the filter state
+        # to prevent sudden sign-flip jumps.
+        ref   = orient_f._x if orient_f._x is not None else raw_q
+        raw_q = _quat_ensure_hemi(raw_q, ref)
+        q_ori = orient_f(raw_q)
+        q_ori /= np.linalg.norm(q_ori) + 1e-9      # renormalise after filtering
+        # Compose: ORIENT_OFFSET rotates the MediaPipe-derived orientation
+        # to match the LEAP hand's rest pose in the XML.
+        data.mocap_quat[mid] = _quat_mul(ORIENT_OFFSET, q_ori)
     # ── Direct angle retargeting ──────────────────────────────────────────────
     q_raw    = ik.retarget(None, lm_l)
     q_smooth = joint_f(q_raw)
@@ -234,9 +294,10 @@ def main():
     mid = model.body("hand_proxy").mocapid[0]
 
     # Retargeter and filters
-    ik      = IKRetargeter(model)
-    pos_f   = OneEuroFilter(POS_FREQ,   min_cutoff=POS_MC,   beta=POS_BETA)
-    joint_f = OneEuroFilter(JOINT_FREQ, min_cutoff=JOINT_MC, beta=JOINT_BETA)
+    ik       = IKRetargeter(model)
+    pos_f    = OneEuroFilter(POS_FREQ,    min_cutoff=POS_MC,    beta=POS_BETA)
+    joint_f  = OneEuroFilter(JOINT_FREQ,  min_cutoff=JOINT_MC,  beta=JOINT_BETA)
+    orient_f = OneEuroFilter(ORIENT_FREQ, min_cutoff=ORIENT_MC, beta=ORIENT_BETA)
 
     # Spawn hand at rest position
     _init_hand(model, data)
@@ -250,7 +311,7 @@ def main():
 
     with mujoco.viewer.launch_passive(model, data) as v:
         while v.is_running():
-            _update(data, zed, tracker, ik, pos_f, joint_f, mid)
+            _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, mid)
 
             mujoco.mj_step(model, data)
             v.sync()

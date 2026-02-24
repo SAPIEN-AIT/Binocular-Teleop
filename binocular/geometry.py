@@ -67,7 +67,7 @@ _DEPTH_ANCHORS: List[int] = [0, 5, 9, 13]   # wrist, index-MCP, mid-MCP, ring-MC
 # ── Epipolar constraint ───────────────────────────────────────────────────────
 
 def check_epipolar_constraint(y_left: float, y_right: float,
-                               tolerance_px: float = 5) -> tuple:
+                            tolerance_px: float = 5) -> tuple:
     """
     Return (is_valid, error_px).
 
@@ -81,7 +81,7 @@ def check_epipolar_constraint(y_left: float, y_right: float,
 # ── Back-projection ───────────────────────────────────────────────────────────
 
 def back_project(u: float, v: float, z_m: float,
-                 cam: PinholeCamera = ZED2I) -> np.ndarray:
+                cam: PinholeCamera = ZED2I) -> np.ndarray:
     """
     Convert a pixel (u, v) + depth z_m [metres] to a 3-D camera-frame point.
 
@@ -100,7 +100,7 @@ def back_project(u: float, v: float, z_m: float,
 # ── Stereo depth averaging ────────────────────────────────────────────────────
 
 def stereo_depth_m(lm_l, lm_r, frame_w: int,
-                   cam: PinholeCamera = ZED2I,
+                    cam: PinholeCamera = ZED2I,
                    anchors: List[int] = _DEPTH_ANCHORS) -> float | None:
     """
     Compute a robust depth estimate [metres] by triangulating several stable
@@ -135,9 +135,9 @@ def stereo_depth_m(lm_l, lm_r, frame_w: int,
 # ── Full stereo 3-D hand position ─────────────────────────────────────────────
 
 def stereo_hand_3d(lm_l, lm_r, frame_w: int, frame_h: int,
-                   cam: PinholeCamera = ZED2I,
-                   depth_min_m: float = 0.15,
-                   depth_max_m: float = 1.20) -> np.ndarray | None:
+                    cam: PinholeCamera = ZED2I,
+                    depth_min_m: float = 0.15,
+                    depth_max_m: float = 1.20) -> np.ndarray | None:
     """
     Return the 3-D wrist position [metres] in the left-camera frame.
 
