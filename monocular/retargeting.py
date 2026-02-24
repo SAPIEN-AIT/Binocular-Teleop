@@ -54,6 +54,26 @@ def compute_finger_angles(lm, mcp, pip, dip, tip):
 
     return mcp_angle, pip_angle, dip_angle
 
+def wrist_to_world_pos(landmarks, z_fixed=0.12):
+    """
+    Maps the wrist 2D image position to a sim world position.
+    x, y come from MediaPipe (normalized 0→1 in image space).
+    z stays fixed — monocular has no depth, binocular will fix this.
+
+    Coordinate mapping:
+      image x (0=left,  1=right) → sim x  (mirrored for natural feel)
+      image y (0=top,   1=bot)   → sim y  (inverted: up in image = forward in sim)
+      depth                      → sim z  (fixed height above floor)
+    """
+    wrist = landmarks[WRIST]
+
+    sim_x = -(wrist.x - 0.5) * 0.4   # mirror so moving right moves hand right
+    sim_y =  (0.5 - wrist.y) * 0.3   # invert: image y grows down, sim y grows up
+    sim_z =  z_fixed
+
+    return [sim_x, sim_y, sim_z]
+
+
 def landmarks_to_joints(landmarks):
     """
     Takes 21 MediaPipe landmarks, returns 16 LEAP joint angles.

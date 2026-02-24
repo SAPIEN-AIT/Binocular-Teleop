@@ -1,10 +1,10 @@
 import cv2
-from camera import ZEDCamera
-from detectors import StereoHandTracker
-import geometry
+from binocular.camera import ZEDCamera
+from binocular.detectors import StereoHandTracker
+import binocular.geometry as geometry
 
 def main():
-    zed = ZEDCamera(camera_id=1) # Try 0 if 1 fails
+    zed = ZEDCamera(camera_id=1, y_offset=geometry.Y_OFFSET_PX)  # Try camera_id=0 if 1 fails
     tracker = StereoHandTracker()
 
     print("Running Stereo Triangulation... Press 'q' to quit.")
@@ -41,7 +41,7 @@ def main():
             py_r = int(tip_r.y * h)
 
             # 3. Apply the Geometry (The Paper's Core Concept)
-            is_valid, error = geometry.check_epipolar_constraint(py_l, py_r)
+            is_valid, error = geometry.check_epipolar_constraint(py_l, py_r)  # tolerance now 5 px
 
             if is_valid:
                 depth = geometry.triangulate_depth(px_l, px_r)
