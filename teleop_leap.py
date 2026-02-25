@@ -72,21 +72,18 @@ START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 # Epipolar constraint — only checked when STEREO_DEPTH = True
 EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for your unit)
 
-# ── Wrist orientation ─────────────────────────────────────────────────────────────────────
-# Disabled while tuning finger IK — enable once fingers track correctly.
-# When True, rotate ORIENT_OFFSET until the sim palm matches your real palm at rest.
-WRIST_ORIENT  = False  # drive mocap_quat from palm normal; False = locked identity
+# ── Wrist Z-rotation (via mocap_quat) ────────────────────────────────────────
+WRIST_SCALE    = 0.5    # gain on detected angle delta
+WRIST_DEADZONE = 0.10   # rad (~6°) — noise below this ignored
+WRIST_MAX_RAD  = 1.2    # ±69° max clamp
 
-# One Euro Filter for quaternion (4-dim)
-ORIENT_FREQ   = 30.0
-ORIENT_MC     = 1.5    # higher than pos — rotations need faster response
-ORIENT_BETA   = 0.05
+# One Euro Filter for wrist angle (1-dim)
+WRIST_FREQ     = 30.0
+WRIST_MC       = 0.3
+WRIST_BETA     = 0.01
 
-# Static rotation applied AFTER the MediaPipe-derived quaternion.
-# Compensates for the LEAP hand's rest orientation in the XML.
-# Tune until the sim palm matches your real palm when flat facing the camera.
-# Format: (w, x, y, z).  Identity = no offset.
-ORIENT_OFFSET = np.array([0.707, -0.707, 0.0, 0.0])   # Rx(-90°): cancels palm-facing-camera rest pose
+# Rest orientation of the hand (unchanged from last push)
+BASE_QUAT = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up
 
 # ── Handedness filter ─────────────────────────────────────────────────────────────────────
 # ZED is a non-mirrored camera: your RIGHT hand appears on the LEFT side of the
@@ -130,16 +127,14 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData):
     """
     mid  = model.body("hand_proxy").mocapid[0]
     pos  = np.array([0.0, START_Y, START_Z])
-    quat = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up
 
     data.mocap_pos[mid]  = pos
-    data.mocap_quat[mid] = quat
+    data.mocap_quat[mid] = BASE_QUAT.copy()
 
-    # Also move the freejoint so palm spawns at the right place
     jid  = model.joint("palm_free").id
     addr = model.jnt_qposadr[jid]
-    data.qpos[addr:addr+3] = pos       # position
-    data.qpos[addr+3:addr+7] = quat    # quaternion (w, x, y, z)
+    data.qpos[addr:addr+3] = pos
+    data.qpos[addr+3:addr+7] = BASE_QUAT
 
     mujoco.mj_forward(model, data)
 
@@ -160,6 +155,7 @@ def _update(data:     mujoco.MjData,
     If stereo fails on a frame, the last good position is kept but fingers
     still update — no frame is ever fully dropped.
     """
+    global _wrist_ref_angle, _wrist_calib_count
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
@@ -169,6 +165,10 @@ def _update(data:     mujoco.MjData,
 
     # ── Left camera must see a hand to do anything ────────────────────────
     if not res_l.multi_hand_landmarks:
+        _wrist_ref_angle = None
+        _wrist_calib_count = 0
+        orient_f.reset()
+        data.mocap_quat[mid] = BASE_QUAT.copy()
         if SHOW_CAMERA:
             cv2.putText(frame_l, "L: NO HAND", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -229,14 +229,29 @@ def _update(data:     mujoco.MjData,
     raw_pos = np.array([sim_x, sim_y, sim_z])
     data.mocap_pos[mid] = pos_f(raw_pos)
 
-    # ── Wrist orientation ─────────────────────────────────────────────────
-    if WRIST_ORIENT:
-        raw_q = palm_quat(lm_l)
-        ref   = orient_f._x if orient_f._x is not None else raw_q
-        raw_q = _quat_ensure_hemi(raw_q, ref)
-        q_ori = orient_f(raw_q)
-        q_ori /= np.linalg.norm(q_ori) + 1e-9
-        data.mocap_quat[mid] = _quat_mul(ORIENT_OFFSET, q_ori)
+    # ── Wrist Z-rotation (pure Rz on mocap_quat) ────────────────────────
+    idx_mcp  = lm_l[5]
+    ring_mcp = lm_l[13]
+    raw_angle = np.arctan2(ring_mcp.y - idx_mcp.y, ring_mcp.x - idx_mcp.x)
+
+    if _wrist_ref_angle is None:
+        _wrist_ref_angle = raw_angle
+        _wrist_calib_count = 1
+    elif _wrist_calib_count < 15:
+        err = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        _wrist_ref_angle += 0.2 * err
+        _wrist_calib_count += 1
+
+    delta = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
+    delta = float(np.clip(delta, -0.9, 0.9))
+    delta = float(orient_f(np.array([delta]))[0])
+    if abs(delta) < WRIST_DEADZONE:
+        delta = 0.0
+    wrist_z = float(np.clip(delta * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+    half = wrist_z / 2.0
+    q_z = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
+    data.mocap_quat[mid] = _quat_mul(q_z, BASE_QUAT)
 
     # ── Direct angle retargeting (always from left camera) ────────────────
     q_raw    = ik.retarget(None, lm_l)
@@ -278,6 +293,8 @@ def _update(data:     mujoco.MjData,
     _show(display if SHOW_CAMERA else frame_l)
 
 
+_wrist_ref_angle = None
+_wrist_calib_count = 0
 _frame_q = None
 _show_counter = 0
 _SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)
@@ -326,7 +343,7 @@ def main():
     ik       = IKRetargeter(model)
     pos_f    = OneEuroFilter(POS_FREQ,    min_cutoff=POS_MC,    beta=POS_BETA)
     joint_f  = OneEuroFilter(JOINT_FREQ,  min_cutoff=JOINT_MC,  beta=JOINT_BETA)
-    orient_f = OneEuroFilter(ORIENT_FREQ, min_cutoff=ORIENT_MC, beta=ORIENT_BETA)
+    orient_f = OneEuroFilter(WRIST_FREQ, min_cutoff=WRIST_MC, beta=WRIST_BETA)
 
     # Spawn hand at rest position
     _init_hand(model, data)
