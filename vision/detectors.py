@@ -7,18 +7,18 @@ class StereoHandTracker:
         self.mp_draw = mp.solutions.drawing_utils
         
         # Create TWO independent trackers.
-        # model_complexity=1 is ~2 ms slower per frame but gives significantly
-        # better per-landmark z estimates, which directly drives IK bend angles.
+        # model_complexity=0 is faster (~2ms less per frame); use 1 for better
+        # z estimates if you have CPU headroom.
         self.tracker_left = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            model_complexity=1,
+            model_complexity=0,
             min_detection_confidence=0.5
         )
         self.tracker_right = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            model_complexity=1,
+            model_complexity=0,
             min_detection_confidence=0.5
         )
 

@@ -36,13 +36,13 @@ from vision.smoother                     import OneEuroFilter
 from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
-CAMERA_ID    = 0       # ZED device index (try 0 if 1 fails)
-N_SUBSTEPS   = 16      # physics sub-steps per vision frame (16 × 2ms = 32ms ≈ real-time at 30 fps)
+CAMERA_ID    = 0       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
+N_SUBSTEPS   = 8       # physics sub-steps per vision frame (8 × 2ms = 16ms, ~80% tracking)
 
 # ── Mode toggle ───────────────────────────────────────────────────────────────
 # False = monocular (left frame only, Y fixed) → tune IK first.
-# True  = stereo    (epipolar + triangulated depth) → re-enable once IK works.
-STEREO_DEPTH = False
+# True  = stereo    (epipolar + triangulated depth) → requires ZED camera.
+STEREO_DEPTH = True
 
 # One Euro Filter — joints (16-dim)
 JOINT_FREQ   = 30.0    # Hz: expected vision loop rate
@@ -65,12 +65,12 @@ Z_SCALE      = 0.3     # legacy — no longer used
 DEPTH_MIN_M  = 0.20
 DEPTH_MAX_M  = 0.90
 DEPTH_MID_M  = 0.45    # neutral depth → hand sits at START_Y
-DEPTH_SCALE  = 0.4     # m of sim-Y movement per m of depth change
+DEPTH_SCALE  = 3.0     # m of sim-Y movement per m of depth change (5× previous)
 START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
 START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 
 # Epipolar constraint — only checked when STEREO_DEPTH = True
-EPIPOLAR_TOL = 5       # px (tight, since Y_OFFSET_PX corrects the 30 px bias)
+EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for your unit)
 
 # ── Wrist orientation ─────────────────────────────────────────────────────────────────────
 # Disabled while tuning finger IK — enable once fingers track correctly.
@@ -155,116 +155,90 @@ def _update(data:     mujoco.MjData,
     """
     Single-frame update: capture → detect → retarget → actuate.
 
-    When STEREO_DEPTH=False the right frame and epipolar check are skipped
-    entirely — only the left camera needs to see a hand.
+    Left camera drives finger retargeting (always).
+    When STEREO_DEPTH=True, both cameras triangulate wrist depth for sim-Y.
+    If stereo fails on a frame, the last good position is kept but fingers
+    still update — no frame is ever fully dropped.
     """
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
 
     h, w, _ = frame_l.shape
+    res_l, res_r = tracker.process(frame_l, frame_r)
 
-    if STEREO_DEPTH:
-        # ── Stereo path — full pinhole back-projection ────────────────────────
-        res_l, res_r = tracker.process(frame_l, frame_r)
-
-        if not (res_l.multi_hand_landmarks and res_r.multi_hand_landmarks):
+    # ── Left camera must see a hand to do anything ────────────────────────
+    if not res_l.multi_hand_landmarks:
+        if SHOW_CAMERA:
+            cv2.putText(frame_l, "L: NO HAND", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            if frame_r is not None:
+                r_det = "R: HAND" if res_r.multi_hand_landmarks else "R: NO HAND"
+                r_col = (0, 220, 0) if res_r.multi_hand_landmarks else (0, 0, 255)
+                cv2.putText(frame_r, r_det, (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, r_col, 2)
+                _show(np.hstack([frame_l, frame_r]))
+            else:
+                _show(frame_l)
+        else:
             _show(frame_l)
-            return
+        return
 
-        lm_l = res_l.multi_hand_landmarks[0].landmark
+    lm_l = res_l.multi_hand_landmarks[0].landmark
+    cam   = geo.ZED2I
+
+    # ── Wrist position: lateral + vertical from left camera ───────────────
+    u_w   = lm_l[0].x * w
+    v_w   = lm_l[0].y * h
+    sim_x = -(u_w - cam.cx) / cam.fx * START_Y
+    sim_z =  START_Z - (v_w - cam.cy) / cam.fy * START_Y
+
+    # ── Depth axis (sim Y): stereo triangulation or fixed ─────────────────
+    sim_y      = START_Y
+    depth_cm   = None          # None = no stereo depth available
+    hud_mode   = "MONO [L]"   # displayed mode label
+    hud_col    = (0, 165, 255) # orange = mono
+    hud_detail = ""
+
+    if STEREO_DEPTH and res_r.multi_hand_landmarks:
         lm_r = res_r.multi_hand_landmarks[0].landmark
-
-        # Epipolar check (Y_OFFSET_PX correction already baked into frames)
         py_l = int(lm_l[0].y * h)
         py_r = int(lm_r[0].y * h)
-        valid, epi_err = geo.check_epipolar_constraint(py_l, py_r,
-                                                        tolerance_px=EPIPOLAR_TOL)
-        if not valid:
-            if SHOW_CAMERA:
-                cv2.putText(frame_l, f"EPIPOLAR REJECTED ({epi_err:.0f}px)", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            _show(frame_l)
-            return
+        valid, epi_err = geo.check_epipolar_constraint(
+            py_l, py_r, tolerance_px=EPIPOLAR_TOL)
 
-        # Full 3-D hand position via pinhole back-projection:
-        #   1. Median depth over 4 anchor landmarks (wrist + 3 MCPs) → robust Z
-        #   2. Back-project wrist pixel with principal-point correction → (X,Y,Z)
-        p3d = geo.stereo_hand_3d(lm_l, lm_r, w, h,
-                                  depth_min_m=DEPTH_MIN_M,
-                                  depth_max_m=DEPTH_MAX_M)
-        if p3d is None:
-            # All disparities zero/negative — bad stereo frame, skip
-            _show(frame_l)
-            return
+        if valid:
+            p3d = geo.stereo_hand_3d(lm_l, lm_r, w, h,
+                                      depth_min_m=DEPTH_MIN_M,
+                                      depth_max_m=DEPTH_MAX_M)
+            if p3d is not None:
+                x_m, y_m, z_m = p3d
+                sim_x = -x_m
+                sim_y = START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE
+                sim_z = START_Z - y_m
+                depth_cm = z_m * 100
+                hud_mode   = "STEREO [L+R]"
+                hud_col    = (0, 220, 0)
+                hud_detail = f"epi={epi_err:.0f}px"
+            else:
+                hud_detail = f"bad disparity epi={epi_err:.0f}px"
+        else:
+            hud_detail = f"epi REJECTED err={epi_err:.0f}px"
 
-        x_m, y_m, z_m = p3d   # X: right+, Y: down+, Z: forward+
-
-        # Camera frame → sim frame:
-        #   sim_x: mirror camera X  (your right = sim +x)
-        #   sim_y: camera Z maps to forward depth, offset from neutral
-        #   sim_z: invert camera Y  (camera down = sim up)
-        sim_x = -x_m
-        sim_y =  START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE
-        sim_z =  START_Z - y_m
-
-        if SHOW_CAMERA:
-            cv2.putText(frame_l,
-                        f"Z={z_m*100:.0f}cm  X={x_m*100:+.0f}cm  epi={epi_err:.0f}px",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
-
-    else:
-        # ── Monocular path — left frame only ─────────────────────────────────
-        res_l, _ = tracker.process(frame_l, frame_r)   # right result ignored
-
-        if not res_l.multi_hand_landmarks:
-            if SHOW_CAMERA:
-                cv2.putText(frame_l, "No hand", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-            _show(frame_l)
-            return
-
-        # Reject if the detected hand is not the target hand (avoids mirrored joints).
-        label = res_l.multi_handedness[0].classification[0].label  # "Left" or "Right"
-        if label != TARGET_HAND:
-            if SHOW_CAMERA:
-                cv2.putText(frame_l, f"{label} hand ignored", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-            _show(frame_l)
-            return
-
-        lm_l = res_l.multi_hand_landmarks[0].landmark
-
-        # Principal-point-corrected lateral/vertical.
-        # Equivalent to back_project at a fixed assumed depth of START_Y metres.
-        # Removes the image-centre bias in the old (lm.x - 0.5) formula.
-        cam   = geo.ZED2I
-        u_w   = lm_l[0].x * w
-        v_w   = lm_l[0].y * h
-        sim_x = -(u_w - cam.cx) / cam.fx * START_Y
-        sim_y =  START_Y
-        sim_z =  START_Z - (v_w - cam.cy) / cam.fy * START_Y
-
-        if SHOW_CAMERA:
-            cv2.putText(frame_l, "Monocular IK", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2)
-
-    # ── Mocap position ────────────────────────────────────────────────────────
+    # ── Mocap position ────────────────────────────────────────────────────
     raw_pos = np.array([sim_x, sim_y, sim_z])
     data.mocap_pos[mid] = pos_f(raw_pos)
-    # ── Wrist orientation ───────────────────────────────────────────────────────────────────
+
+    # ── Wrist orientation ─────────────────────────────────────────────────
     if WRIST_ORIENT:
         raw_q = palm_quat(lm_l)
-        # Ensure quaternion stays in the same hemisphere as the filter state
-        # to prevent sudden sign-flip jumps.
         ref   = orient_f._x if orient_f._x is not None else raw_q
         raw_q = _quat_ensure_hemi(raw_q, ref)
         q_ori = orient_f(raw_q)
-        q_ori /= np.linalg.norm(q_ori) + 1e-9      # renormalise after filtering
-        # Compose: ORIENT_OFFSET rotates the MediaPipe-derived orientation
-        # to match the LEAP hand's rest pose in the XML.
+        q_ori /= np.linalg.norm(q_ori) + 1e-9
         data.mocap_quat[mid] = _quat_mul(ORIENT_OFFSET, q_ori)
-    # ── Direct angle retargeting ──────────────────────────────────────────────
+
+    # ── Direct angle retargeting (always from left camera) ────────────────
     q_raw    = ik.retarget(None, lm_l)
     q_smooth = joint_f(q_raw)
     data.ctrl[:] = q_smooth
@@ -272,38 +246,63 @@ def _update(data:     mujoco.MjData,
     if SHOW_CAMERA:
         tracker.draw_landmarks(frame_l, res_l)
 
-    _show(frame_l)
+        # Top-left: mode indicator
+        cv2.putText(frame_l, hud_mode, (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_col, 2)
+        if hud_detail:
+            cv2.putText(frame_l, hud_detail, (20, 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_col, 1)
+
+        # Top-right: depth readout (large)
+        if depth_cm is not None:
+            depth_str = f"DEPTH: {depth_cm:.0f} cm"
+            d_col = (0, 220, 0)
+        else:
+            depth_str = "DEPTH: ---"
+            d_col = (0, 165, 255)
+        txt_size = cv2.getTextSize(depth_str, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        cv2.putText(frame_l, depth_str, (w - txt_size[0] - 20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, d_col, 2)
+
+        # Show both cameras side by side with detection status
+        if frame_r is not None:
+            tracker.draw_landmarks(frame_r, res_r)
+            r_det = "R: HAND" if res_r.multi_hand_landmarks else "R: NO HAND"
+            r_col = (0, 220, 0) if res_r.multi_hand_landmarks else (0, 0, 255)
+            cv2.putText(frame_r, r_det, (20, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, r_col, 2)
+            display = np.hstack([frame_l, frame_r])
+        else:
+            display = frame_l
+
+    _show(display if SHOW_CAMERA else frame_l)
 
 
 _frame_q = None
+_show_counter = 0
+_SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)
+_VIEWER_SCALE = 0.5    # downscale factor for the viewer frame
 
 
 def _show(frame):
-    """Send frame to the viewer subprocess (drops frames if the queue is full)."""
+    """Send a downscaled frame to the viewer subprocess every N calls."""
+    global _show_counter
     if not SHOW_CAMERA or _frame_q is None:
         return
+    _show_counter += 1
+    if _show_counter % _SHOW_EVERY != 0:
+        return
+    small = cv2.resize(frame, None, fx=_VIEWER_SCALE, fy=_VIEWER_SCALE,
+                       interpolation=cv2.INTER_NEAREST)
     if _frame_q.full():
         try:
             _frame_q.get_nowait()
         except Exception:
             pass
     try:
-        _frame_q.put_nowait(frame)
+        _frame_q.put_nowait(small)
     except Exception:
         pass
-
-
-def _viewer_loop(q: _mp.Queue):
-    """Runs in a separate process — displays camera frames via cv2.imshow."""
-    import cv2 as _cv2
-    while True:
-        item = q.get()
-        if item is None:
-            break
-        _cv2.imshow("ZED Left — Binocular Teleop", item)
-        if _cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    _cv2.destroyAllWindows()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -332,12 +331,14 @@ def main():
     # Spawn hand at rest position
     _init_hand(model, data)
 
-    # Camera viewer subprocess (avoids Cocoa conflict with mjpython on macOS)
+    # Camera viewer in a separate lightweight process (only imports cv2,
+    # NOT mujoco — avoids the Cocoa / OpenGL conflict with mjpython on macOS).
     viewer_proc = None
     if SHOW_CAMERA:
+        from _camera_viewer import viewer_loop
         ctx = _mp.get_context("spawn")
         _frame_q = ctx.Queue(maxsize=2)
-        viewer_proc = ctx.Process(target=_viewer_loop, args=(_frame_q,), daemon=True)
+        viewer_proc = ctx.Process(target=viewer_loop, args=(_frame_q,), daemon=True)
         viewer_proc.start()
 
     print("─" * 60)
@@ -347,7 +348,6 @@ def main():
     print("  MuJoCo viewer to quit.")
     print("─" * 60)
 
-    _dbg_count = 0
     with mujoco.viewer.launch_passive(model, data) as v:
         while v.is_running():
             _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, mid)
@@ -355,11 +355,6 @@ def main():
             for _ in range(N_SUBSTEPS):
                 mujoco.mj_step(model, data)
             v.sync()
-
-            _dbg_count += 1
-            if _dbg_count % 60 == 0:
-                np.set_printoptions(precision=2, suppress=True)
-                print(f"[DBG] ctrl = {data.ctrl[:]}")
 
     # Clean shutdown
     if viewer_proc is not None and _frame_q is not None:
