@@ -76,9 +76,10 @@ EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for y
 # Rz = roll  from knuckle line (INDEX_MCP → RING_MCP)
 # Rx = pitch from wrist→middle-MCP tilt (uses MediaPipe .z depth)
 # Ry = yaw   from index↔pinky depth skew (uses MediaPipe .z depth)
-WRIST_SCALE    = 2.0    # gain on detected angle delta (shared Z & X)
+WRIST_SCALE    = 2.0    # gain on detected angle delta (shared X/Y/Z)
 WRIST_DEADZONE = 0.10   # rad (~6°) — noise below this ignored
-WRIST_MAX_RAD  = 1.6    # ±69° max clamp
+WRIST_MAX_RAD  = 1.6    # max clamp
+RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 
 # One Euro Filters for wrist angles (1-dim each)
 WRIST_FREQ     = 30.0
@@ -305,6 +306,14 @@ def _update(data:     mujoco.MjData,
         delta_y = 0.0
     wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
+    # Decouple: shrink Rz toward zero when Ry is active (kills cross-talk)
+    wrist_z_raw = wrist_z
+    reduction = RZ_RY_DECOUPLE * abs(wrist_y)
+    if abs(wrist_z) > reduction:
+        wrist_z = wrist_z - np.sign(wrist_z) * reduction
+    else:
+        wrist_z = 0.0
+
     # ── Compose Ry * Rz * Rx * BASE_QUAT  (Ry↔Rz swapped in MuJoCo) ────
     half_z = wrist_y / 2.0      # yaw detection → MuJoCo Z-axis
     q_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
@@ -344,22 +353,24 @@ def _update(data:     mujoco.MjData,
         rx_deg = float(np.degrees(wrist_x))
         ry_deg = float(np.degrees(wrist_y))
         rz_deg = float(np.degrees(wrist_z))
+        rz_raw_deg = float(np.degrees(wrist_z_raw))
 
         rz_col = (0, 220, 0) if abs(rz_deg) > 0.1 else (100, 100, 100)
-        cv2.putText(frame_l, f"Rz(roll) : {rz_deg:+.1f}",
-                    (15, h - 130), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rz_col, 2)
+        cv2.putText(frame_l, f"Rz(roll) : {rz_deg:+6.1f}  (raw {rz_raw_deg:+.1f})",
+                    (15, h - 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, rz_col, 2)
 
         rx_col = (255, 100, 0) if abs(rx_deg) > 0.1 else (100, 100, 100)
-        cv2.putText(frame_l, f"Rx(pitch): {rx_deg:+.1f}",
-                    (15, h - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rx_col, 2)
+        wz0 = lm_l[0].z; mz9 = lm_l[9].z
+        cv2.putText(frame_l, f"Rx(pitch): {rx_deg:+6.1f}  wrist.z={wz0:+.2f} mid.z={mz9:+.2f}",
+                    (15, h - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, rx_col, 2)
 
         ry_col = (0, 220, 220) if abs(ry_deg) > 0.1 else (100, 100, 100)
         iz5 = lm_l[5].z; pz17 = lm_l[17].z
-        cv2.putText(frame_l, f"Ry(yaw)  : {ry_deg:+.1f}  dz={pz17-iz5:+.3f}",
-                    (15, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ry_col, 2)
+        cv2.putText(frame_l, f"Ry(yaw)  : {ry_deg:+6.1f}  idx.z={iz5:+.2f} pky.z={pz17:+.2f}",
+                    (15, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, ry_col, 2)
 
-        cv2.putText(frame_l, f"Rx:{rx_deg:+.0f} Ry:{ry_deg:+.0f} Rz:{rz_deg:+.0f}",
-                    (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 220), 3)
+        cv2.putText(frame_l, f"SENT  Rx:{rx_deg:+.0f}  Ry:{ry_deg:+.0f}  Rz:{rz_deg:+.0f}",
+                    (15, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 220, 220), 3)
 
         # Show both cameras side by side with detection status
         if frame_r is not None:
