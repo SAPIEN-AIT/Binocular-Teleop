@@ -137,7 +137,7 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData):
 
     # Palm freejoint: initialize at the weld target pose (BASE_QUAT * relpose)
     # relpose = Rx(-90°) → palm at Rx(180°) * Rx(-90°) = Rx(+90°): fingers +Z, palm -Y
-    RELPOSE_QUAT = np.array([0.7071, -0.7071, 0.0, 0.0])
+    RELPOSE_QUAT = np.array([0.5, -0.5, 0.5, 0.5])
     palm_quat_init = _quat_mul(BASE_QUAT, RELPOSE_QUAT)
 
     jid  = model.joint("palm_free").id

@@ -34,7 +34,7 @@
   -->
   <equality>
     <weld body1="hand_proxy" body2="palm"
-          relpose="0 0 0 0.7071 -0.7071 0 0"
+          relpose="0 0 0 0.5 -0.5 0.5 0.5"
           solref="0.01 1" solimp="0.999 0.999 0.001"/>
   </equality>
 
