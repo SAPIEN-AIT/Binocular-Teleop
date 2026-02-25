@@ -87,7 +87,7 @@ WRIST_MC       = 0.3
 WRIST_BETA     = 0.01
 
 # Rest orientation of the hand (unchanged from last push)
-BASE_QUAT = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up
+BASE_QUAT = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up (stable physics)
 
 # ── Handedness filter ─────────────────────────────────────────────────────────────────────
 # ZED is a non-mirrored camera: your RIGHT hand appears on the LEFT side of the
@@ -135,10 +135,15 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData):
     data.mocap_pos[mid]  = pos
     data.mocap_quat[mid] = BASE_QUAT.copy()
 
+    # Palm freejoint: initialize at the weld target pose (BASE_QUAT * relpose)
+    # relpose = Rx(-90°) → palm at Rx(180°) * Rx(-90°) = Rx(+90°): fingers +Z, palm -Y
+    RELPOSE_QUAT = np.array([0.7071, -0.7071, 0.0, 0.0])
+    palm_quat_init = _quat_mul(BASE_QUAT, RELPOSE_QUAT)
+
     jid  = model.joint("palm_free").id
     addr = model.jnt_qposadr[jid]
     data.qpos[addr:addr+3] = pos
-    data.qpos[addr+3:addr+7] = BASE_QUAT
+    data.qpos[addr+3:addr+7] = palm_quat_init
 
     mujoco.mj_forward(model, data)
 
