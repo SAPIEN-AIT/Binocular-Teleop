@@ -23,6 +23,7 @@ Tuning guide (constants block below):
 """
 
 import os
+import multiprocessing as _mp
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -36,6 +37,7 @@ from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 0       # ZED device index (try 0 if 1 fails)
+N_SUBSTEPS   = 16      # physics sub-steps per vision frame (16 × 2ms = 32ms ≈ real-time at 30 fps)
 
 # ── Mode toggle ───────────────────────────────────────────────────────────────
 # False = monocular (left frame only, Y fixed) → tune IK first.
@@ -93,7 +95,7 @@ TARGET_HAND   = "Left"   # tracks your physical right hand on a non-mirrored ZED
 
 # cv2.imshow conflicts with mjpython's Cocoa event loop on macOS.
 # Set to True only when running with plain `python` (not `mjpython`).
-SHOW_CAMERA  = False
+SHOW_CAMERA  = True
 
 # ── Quaternion helpers ────────────────────────────────────────────────────────
 def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -128,7 +130,7 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData):
     """
     mid  = model.body("hand_proxy").mocapid[0]
     pos  = np.array([0.0, START_Y, START_Z])
-    quat = np.array([1.0, 0.0, 0.0, 0.0])
+    quat = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up
 
     data.mocap_pos[mid]  = pos
     data.mocap_quat[mid] = quat
@@ -273,13 +275,41 @@ def _update(data:     mujoco.MjData,
     _show(frame_l)
 
 
+_frame_q = None
+
+
 def _show(frame):
-    if SHOW_CAMERA:
-        cv2.imshow("ZED Left — Binocular Teleop", frame)
+    """Send frame to the viewer subprocess (drops frames if the queue is full)."""
+    if not SHOW_CAMERA or _frame_q is None:
+        return
+    if _frame_q.full():
+        try:
+            _frame_q.get_nowait()
+        except Exception:
+            pass
+    try:
+        _frame_q.put_nowait(frame)
+    except Exception:
+        pass
+
+
+def _viewer_loop(q: _mp.Queue):
+    """Runs in a separate process — displays camera frames via cv2.imshow."""
+    import cv2 as _cv2
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        _cv2.imshow("ZED Left — Binocular Teleop", item)
+        if _cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    _cv2.destroyAllWindows()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
+    global _frame_q
+
     # Hardware
     # Pass y_offset so vertical alignment is ready when STEREO_DEPTH is re-enabled.
     zed     = ZEDCamera(camera_id=CAMERA_ID,
@@ -302,6 +332,14 @@ def main():
     # Spawn hand at rest position
     _init_hand(model, data)
 
+    # Camera viewer subprocess (avoids Cocoa conflict with mjpython on macOS)
+    viewer_proc = None
+    if SHOW_CAMERA:
+        ctx = _mp.get_context("spawn")
+        _frame_q = ctx.Queue(maxsize=2)
+        viewer_proc = ctx.Process(target=_viewer_loop, args=(_frame_q,), daemon=True)
+        viewer_proc.start()
+
     print("─" * 60)
     print("  Binocular Hand Teleoperation (Direct Angle Retargeting)")
     print("  Move your right hand in front of the ZED camera.")
@@ -309,16 +347,24 @@ def main():
     print("  MuJoCo viewer to quit.")
     print("─" * 60)
 
+    _dbg_count = 0
     with mujoco.viewer.launch_passive(model, data) as v:
         while v.is_running():
             _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, mid)
 
-            mujoco.mj_step(model, data)
+            for _ in range(N_SUBSTEPS):
+                mujoco.mj_step(model, data)
             v.sync()
 
-            # Allow quitting from the camera window
-            if SHOW_CAMERA and cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            _dbg_count += 1
+            if _dbg_count % 60 == 0:
+                np.set_printoptions(precision=2, suppress=True)
+                print(f"[DBG] ctrl = {data.ctrl[:]}")
+
+    # Clean shutdown
+    if viewer_proc is not None and _frame_q is not None:
+        _frame_q.put(None)
+        viewer_proc.join(timeout=3)
 
     zed.close()
     cv2.destroyAllWindows()
