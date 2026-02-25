@@ -16,9 +16,9 @@ Press Q to quit.
 import cv2
 import numpy as np
 
-from binocular.camera    import ZEDCamera
-from binocular.detectors import StereoHandTracker
-import binocular.geometry as geo
+from vision.camera    import ZEDCamera
+from vision.detectors import StereoHandTracker
+import vision.geometry as geo
 
 CAMERA_ID    = 0
 # Tolerance is tight now that the 30 px vertical bias is corrected at the

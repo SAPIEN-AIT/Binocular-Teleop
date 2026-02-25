@@ -1,5 +1,5 @@
 """
-mujoco_teleop.py — Hand teleoperation with direct angle retargeting.
+teleop_leap.py — Hand teleoperation with direct angle retargeting.
 
 Pipeline (30 Hz vision loop):
   ZED left camera frame (monocular mode)
@@ -13,7 +13,7 @@ Pipeline (30 Hz vision loop):
   Once IK is fully tuned, flip that flag to re-enable epipolar + triangulation.
 
 Run with mjpython (NOT plain python — cv2.imshow conflicts with Cocoa on macOS):
-    mjpython mujoco_teleop.py
+    mjpython teleop_leap.py
 
 Tuning guide (constants block below):
     JOINT_MC / JOINT_BETA  — joint filter: lower MC = smoother, higher beta = less lag
@@ -28,10 +28,10 @@ import mujoco
 import mujoco.viewer
 import cv2
 
-from binocular.camera                    import ZEDCamera
-from binocular.detectors                 import StereoHandTracker
-import binocular.geometry                as geo
-from binocular.smoother                  import OneEuroFilter
+from vision.camera                       import ZEDCamera
+from vision.detectors                    import StereoHandTracker
+import vision.geometry                   as geo
+from vision.smoother                     import OneEuroFilter
 from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
@@ -84,7 +84,7 @@ ORIENT_BETA   = 0.05
 # Compensates for the LEAP hand's rest orientation in the XML.
 # Tune until the sim palm matches your real palm when flat facing the camera.
 # Format: (w, x, y, z).  Identity = no offset.
-ORIENT_OFFSET = np.array([1.0, 0.0, 0.0, 0.0])
+ORIENT_OFFSET = np.array([0.707, -0.707, 0.0, 0.0])   # Rx(-90°): cancels palm-facing-camera rest pose
 
 # ── Handedness filter ─────────────────────────────────────────────────────────────────────
 # ZED is a non-mirrored camera: your RIGHT hand appears on the LEFT side of the
@@ -115,7 +115,7 @@ def _quat_ensure_hemi(q: np.ndarray, ref: np.ndarray) -> np.ndarray:
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DIR       = os.path.dirname(os.path.abspath(__file__))
-_SCENE_XML = os.path.join(_DIR, "leap_hand", "scene_binocular.xml")
+_SCENE_XML = os.path.join(_DIR, "robots", "leap_hand", "scene.xml")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

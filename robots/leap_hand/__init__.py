@@ -35,8 +35,5 @@ class LeapController(RobotController):
 
     @classmethod
     def scene_xml_path(cls) -> str:
-        """Path to the binocular-ready LEAP scene XML."""
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "leap_hand", "scene_binocular.xml",
-        )
+        """Path to the LEAP scene XML (co-located with this package)."""
+        return os.path.join(os.path.dirname(__file__), "scene.xml")

@@ -1,18 +1,13 @@
 """
-robots/franka — Franka FR3 controller (placeholder).
+robots/franka — Franka FR3 arm controller.
 
-This package is not yet implemented.  When adding Franka control:
-
-1. Implement ``FrankaController(RobotController)`` here with:
-   - ``retarget(landmarks) -> np.ndarray``  (7 joint targets or end-effector pose)
-   - ``scene_xml_path() -> str``            (path to franka_fr3_v2/scene.xml or similar)
-
-2. Replace the LEAP-specific constants in mujoco_teleop.py (START_Y, mocap body
-   name, scene XML path) with a ``robot = FrankaController(model)`` call so the
-   rest of the loop stays robot-agnostic.
-
-Reference XML: ``franka_fr3_v2/scene.xml``
+Exports
+-------
+  FrankaIKRetargeter   direct angle-based retargeter (MediaPipe Pose → 7 joint angles)
+  FrankaController     thin RobotController wrapper around FrankaIKRetargeter
 """
+
+from robots.franka.ik_retargeting import FrankaIKRetargeter  # noqa: F401
 
 import os
 import numpy as np
@@ -22,17 +17,21 @@ from robots.base import RobotController
 
 class FrankaController(RobotController):
     """
-    Placeholder: Franka FR3 controller.
+    RobotController implementation for the Franka FR3 arm.
 
-    Raises NotImplementedError until the retargeting logic is written.
+    Wraps FrankaIKRetargeter so the teleoperation loop can use the generic
+    RobotController interface.
     """
 
+    def __init__(self, model: mujoco.MjModel) -> None:
+        super().__init__(model)
+        self._ik = FrankaIKRetargeter(model)
+
     def retarget(self, landmarks) -> np.ndarray:
-        raise NotImplementedError("Franka retargeting is not yet implemented.")
+        """Map MediaPipe Pose result → 7 Franka actuator targets."""
+        return self._ik.retarget(landmarks)
 
     @classmethod
     def scene_xml_path(cls) -> str:
-        return os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "franka_fr3_v2", "scene.xml",
-        )
+        """Path to the Franka scene XML (co-located with this package)."""
+        return os.path.join(os.path.dirname(__file__), "scene.xml")
