@@ -72,12 +72,15 @@ START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 # Epipolar constraint — only checked when STEREO_DEPTH = True
 EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for your unit)
 
-# ── Wrist Z-rotation (via mocap_quat) ────────────────────────────────────────
-WRIST_SCALE    = 0.5    # gain on detected angle delta
+# ── Wrist rotation (via mocap_quat) ──────────────────────────────────────────
+# Rz = roll  from knuckle line (INDEX_MCP → RING_MCP)
+# Rx = pitch from wrist→middle-MCP tilt (uses MediaPipe .z depth)
+# Ry = yaw   from index↔pinky depth skew (uses MediaPipe .z depth)
+WRIST_SCALE    = 2.0    # gain on detected angle delta (shared Z & X)
 WRIST_DEADZONE = 0.10   # rad (~6°) — noise below this ignored
-WRIST_MAX_RAD  = 1.2    # ±69° max clamp
+WRIST_MAX_RAD  = 1.6    # ±69° max clamp
 
-# One Euro Filter for wrist angle (1-dim)
+# One Euro Filters for wrist angles (1-dim each)
 WRIST_FREQ     = 30.0
 WRIST_MC       = 0.3
 WRIST_BETA     = 0.01
@@ -146,6 +149,8 @@ def _update(data:     mujoco.MjData,
             pos_f:    OneEuroFilter,
             joint_f:  OneEuroFilter,
             orient_f: OneEuroFilter,
+            pitch_f:  OneEuroFilter,
+            yaw_f:    OneEuroFilter,
             mid:      int) -> None:
     """
     Single-frame update: capture → detect → retarget → actuate.
@@ -155,7 +160,7 @@ def _update(data:     mujoco.MjData,
     If stereo fails on a frame, the last good position is kept but fingers
     still update — no frame is ever fully dropped.
     """
-    global _wrist_ref_angle, _wrist_calib_count
+    global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
@@ -167,7 +172,13 @@ def _update(data:     mujoco.MjData,
     if not res_l.multi_hand_landmarks:
         _wrist_ref_angle = None
         _wrist_calib_count = 0
+        _pitch_ref_angle = None
+        _pitch_calib_count = 0
+        _yaw_ref_angle = None
+        _yaw_calib_count = 0
         orient_f.reset()
+        pitch_f.reset()
+        yaw_f.reset()
         data.mocap_quat[mid] = BASE_QUAT.copy()
         if SHOW_CAMERA:
             cv2.putText(frame_l, "L: NO HAND", (20, 40),
@@ -187,9 +198,10 @@ def _update(data:     mujoco.MjData,
     lm_l = res_l.multi_hand_landmarks[0].landmark
     cam   = geo.ZED2I
 
-    # ── Wrist position: lateral + vertical from left camera ───────────────
-    u_w   = lm_l[0].x * w
-    v_w   = lm_l[0].y * h
+    # ── Palm center position (avg of wrist + 4 MCP) ────────────────────
+    _palm_ids = (0, 5, 9, 13, 17)  # wrist, index/middle/ring/pinky MCP
+    u_w = sum(lm_l[i].x for i in _palm_ids) / len(_palm_ids) * w
+    v_w = sum(lm_l[i].y for i in _palm_ids) / len(_palm_ids) * h
     sim_x = -(u_w - cam.cx) / cam.fx * START_Y
     sim_z =  START_Z - (v_w - cam.cy) / cam.fy * START_Y
 
@@ -247,11 +259,60 @@ def _update(data:     mujoco.MjData,
     delta = float(orient_f(np.array([delta]))[0])
     if abs(delta) < WRIST_DEADZONE:
         delta = 0.0
-    wrist_z = float(np.clip(delta * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+    wrist_z = float(np.clip(delta * WRIST_SCALE * 0.3, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
-    half = wrist_z / 2.0
-    q_z = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])
-    data.mocap_quat[mid] = _quat_mul(q_z, BASE_QUAT)
+    # ── Wrist X-rotation (pitch from wrist→middle-MCP tilt) ─────────────
+    mid_mcp = lm_l[9]
+    wrist_lm = lm_l[0]
+    dy_p = mid_mcp.y - wrist_lm.y
+    dz_p = mid_mcp.z - wrist_lm.z
+    raw_pitch = np.arctan2(dz_p, dy_p)
+
+    if _pitch_ref_angle is None:
+        _pitch_ref_angle = raw_pitch
+        _pitch_calib_count = 1
+    elif _pitch_calib_count < 15:
+        err_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        _pitch_ref_angle += 0.2 * err_p
+        _pitch_calib_count += 1
+
+    delta_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
+    delta_p = float(np.clip(delta_p, -0.9, 0.9))
+    delta_p = float(pitch_f(np.array([delta_p]))[0])
+    if abs(delta_p) < WRIST_DEADZONE:
+        delta_p = 0.0
+    wrist_x = float(np.clip(delta_p * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+    # ── Wrist Y-rotation (yaw from index↔pinky depth skew) ──────────────
+    idx_mcp_y = lm_l[5]
+    pky_mcp_y = lm_l[17]
+    dx_y = pky_mcp_y.x - idx_mcp_y.x
+    dz_y = pky_mcp_y.z - idx_mcp_y.z
+    raw_yaw = np.arctan2(dz_y, dx_y)
+
+    if _yaw_ref_angle is None:
+        _yaw_ref_angle = raw_yaw
+        _yaw_calib_count = 1
+    elif _yaw_calib_count < 15:
+        err_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        _yaw_ref_angle += 0.2 * err_y
+        _yaw_calib_count += 1
+
+    delta_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
+    delta_y = float(np.clip(delta_y, -0.9, 0.9))
+    delta_y = float(yaw_f(np.array([delta_y]))[0])
+    if abs(delta_y) < WRIST_DEADZONE:
+        delta_y = 0.0
+    wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+    # ── Compose Ry * Rz * Rx * BASE_QUAT  (Ry↔Rz swapped in MuJoCo) ────
+    half_z = wrist_y / 2.0      # yaw detection → MuJoCo Z-axis
+    q_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
+    half_y = wrist_z / 2.0      # roll detection → MuJoCo Y-axis
+    q_y = np.array([np.cos(half_y), 0.0, np.sin(half_y), 0.0])
+    half_x = wrist_x / 2.0
+    q_x = np.array([np.cos(half_x), np.sin(half_x), 0.0, 0.0])
+    data.mocap_quat[mid] = _quat_mul(q_y, _quat_mul(q_z, _quat_mul(q_x, BASE_QUAT)))
 
     # ── Direct angle retargeting (always from left camera) ────────────────
     q_raw    = ik.retarget(None, lm_l)
@@ -279,6 +340,27 @@ def _update(data:     mujoco.MjData,
         cv2.putText(frame_l, depth_str, (w - txt_size[0] - 20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, d_col, 2)
 
+        # Bottom: rotation debug per axis (large text)
+        rx_deg = float(np.degrees(wrist_x))
+        ry_deg = float(np.degrees(wrist_y))
+        rz_deg = float(np.degrees(wrist_z))
+
+        rz_col = (0, 220, 0) if abs(rz_deg) > 0.1 else (100, 100, 100)
+        cv2.putText(frame_l, f"Rz(roll) : {rz_deg:+.1f}",
+                    (15, h - 130), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rz_col, 2)
+
+        rx_col = (255, 100, 0) if abs(rx_deg) > 0.1 else (100, 100, 100)
+        cv2.putText(frame_l, f"Rx(pitch): {rx_deg:+.1f}",
+                    (15, h - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rx_col, 2)
+
+        ry_col = (0, 220, 220) if abs(ry_deg) > 0.1 else (100, 100, 100)
+        iz5 = lm_l[5].z; pz17 = lm_l[17].z
+        cv2.putText(frame_l, f"Ry(yaw)  : {ry_deg:+.1f}  dz={pz17-iz5:+.3f}",
+                    (15, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ry_col, 2)
+
+        cv2.putText(frame_l, f"Rx:{rx_deg:+.0f} Ry:{ry_deg:+.0f} Rz:{rz_deg:+.0f}",
+                    (15, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 220), 3)
+
         # Show both cameras side by side with detection status
         if frame_r is not None:
             tracker.draw_landmarks(frame_r, res_r)
@@ -295,6 +377,10 @@ def _update(data:     mujoco.MjData,
 
 _wrist_ref_angle = None
 _wrist_calib_count = 0
+_pitch_ref_angle = None
+_pitch_calib_count = 0
+_yaw_ref_angle = None
+_yaw_calib_count = 0
 _frame_q = None
 _show_counter = 0
 _SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)
@@ -344,6 +430,8 @@ def main():
     pos_f    = OneEuroFilter(POS_FREQ,    min_cutoff=POS_MC,    beta=POS_BETA)
     joint_f  = OneEuroFilter(JOINT_FREQ,  min_cutoff=JOINT_MC,  beta=JOINT_BETA)
     orient_f = OneEuroFilter(WRIST_FREQ, min_cutoff=WRIST_MC, beta=WRIST_BETA)
+    pitch_f  = OneEuroFilter(WRIST_FREQ, min_cutoff=WRIST_MC, beta=WRIST_BETA)
+    yaw_f    = OneEuroFilter(WRIST_FREQ, min_cutoff=WRIST_MC, beta=WRIST_BETA)
 
     # Spawn hand at rest position
     _init_hand(model, data)
@@ -367,7 +455,7 @@ def main():
 
     with mujoco.viewer.launch_passive(model, data) as v:
         while v.is_running():
-            _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, mid)
+            _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, pitch_f, yaw_f, mid)
 
             for _ in range(N_SUBSTEPS):
                 mujoco.mj_step(model, data)
