@@ -141,7 +141,10 @@
                       <geom mesh="link7_4" material="white" class="visual"/>
                       <geom mesh="link7_5" material="white" class="visual"/>
                       <geom mesh="link7_6" material="white" class="visual"/>
-                      <body name="fr3v2_link8" pos="0 0 0.107"/>
+                      <body name="fr3v2_link8" pos="0 0 0.107">
+                        <!-- IK target site — used by FrankaJacobianIK for mj_jac() -->
+                        <site name="end_effector" pos="0 0 0" size="0.025" rgba="1 0.3 0 0.8"/>
+                      </body>
                     </body>
                   </body>
                 </body>
