@@ -66,7 +66,8 @@ DEPTH_MIN_M  = 0.20
 DEPTH_MAX_M  = 0.90
 DEPTH_MID_M  = 0.45    # neutral depth → hand sits at START_Y
 DEPTH_SCALE  = 3.0     # m of sim-Y movement per m of depth change (5× previous)
-TRANS_SCALE  = 1.5     # global translation gain (+50%)
+TRANS_SCALE  = 2.5
+     # global translation gain (+50%)
 START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
 START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 
@@ -79,8 +80,8 @@ EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for y
 # Ry = yaw   from index↔pinky depth skew (uses MediaPipe .z depth)
 WRIST_SCALE    = 2.0    # gain on detected angle delta (shared X/Y/Z)  [-20%]
 WRIST_DZ_RX    = 0.03   # rad (~7°) — deadzone pitch
-WRIST_DZ_RY    = 0.12   # rad (~7°) — deadzone yaw
-WRIST_DZ_RZ    = 0.10   # rad (~6°) — deadzone roll
+WRIST_DZ_RY    = 0.08   # rad (~7°) — deadzone yaw
+WRIST_DZ_RZ    = 0.12   # rad (~6°) — deadzone roll
 WRIST_MAX_RAD  = 1.6    # max clamp
 RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 
@@ -88,6 +89,9 @@ RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 WRIST_FREQ     = 30.0
 WRIST_MC       = 0.3
 WRIST_BETA     = 0.01
+
+# Hold last pose when hand disappears (avoids jerk on tracking loss)
+HOLD_POSE_SEC  = 1.0   # seconds to hold last pose before resetting
 
 # Rest orientation of the hand (unchanged from last push)
 BASE_QUAT = np.array([0.0, 1.0, 0.0, 0.0])   # Rx(180°): palm facing up (stable physics)
@@ -169,7 +173,8 @@ def _update(data:     mujoco.MjData,
     If stereo fails on a frame, the last good position is kept but fingers
     still update — no frame is ever fully dropped.
     """
-    global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count
+    global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count, _last_hand_time
+    import time as _time
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
@@ -179,19 +184,26 @@ def _update(data:     mujoco.MjData,
 
     # ── Left camera must see a hand to do anything ────────────────────────
     if not res_l.multi_hand_landmarks:
-        _wrist_ref_angle = None
-        _wrist_calib_count = 0
-        _pitch_ref_angle = None
-        _pitch_calib_count = 0
-        _yaw_ref_angle = None
-        _yaw_calib_count = 0
-        orient_f.reset()
-        pitch_f.reset()
-        yaw_f.reset()
-        data.mocap_quat[mid] = BASE_QUAT.copy()
+        elapsed = _time.monotonic() - _last_hand_time
+        holding = elapsed < HOLD_POSE_SEC and _last_hand_time > 0
+
+        if not holding:
+            _wrist_ref_angle = None
+            _wrist_calib_count = 0
+            _pitch_ref_angle = None
+            _pitch_calib_count = 0
+            _yaw_ref_angle = None
+            _yaw_calib_count = 0
+            orient_f.reset()
+            pitch_f.reset()
+            yaw_f.reset()
+            data.mocap_quat[mid] = BASE_QUAT.copy()
+
+        hold_label = f"HOLD {HOLD_POSE_SEC - elapsed:.1f}s" if holding else "NO HAND"
+        hold_col   = (0, 200, 255) if holding else (0, 0, 255)
         if SHOW_CAMERA:
-            cv2.putText(frame_l, "L: NO HAND", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(frame_l, f"L: {hold_label}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, hold_col, 2)
             if frame_r is not None:
                 r_det = "R: HAND" if res_r.multi_hand_landmarks else "R: NO HAND"
                 r_col = (0, 220, 0) if res_r.multi_hand_landmarks else (0, 0, 255)
@@ -258,7 +270,7 @@ def _update(data:     mujoco.MjData,
     if _wrist_ref_angle is None:
         _wrist_ref_angle = raw_angle
         _wrist_calib_count = 1
-    elif _wrist_calib_count < 15:
+    elif _wrist_calib_count < 40:
         err = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
         _wrist_ref_angle += 0.2 * err
         _wrist_calib_count += 1
@@ -268,6 +280,8 @@ def _update(data:     mujoco.MjData,
     delta = float(orient_f(np.array([delta]))[0])
     if abs(delta) < WRIST_DZ_RZ:
         delta = 0.0
+    else:
+        delta = np.sign(delta) * (abs(delta) - WRIST_DZ_RZ)
     wrist_z = float(np.clip(delta * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
     # ── Wrist X-rotation (pitch from wrist→middle-MCP tilt) ─────────────
@@ -280,7 +294,7 @@ def _update(data:     mujoco.MjData,
     if _pitch_ref_angle is None:
         _pitch_ref_angle = raw_pitch
         _pitch_calib_count = 1
-    elif _pitch_calib_count < 15:
+    elif _pitch_calib_count < 40:
         err_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
         _pitch_ref_angle += 0.2 * err_p
         _pitch_calib_count += 1
@@ -290,6 +304,8 @@ def _update(data:     mujoco.MjData,
     delta_p = float(pitch_f(np.array([delta_p]))[0])
     if abs(delta_p) < WRIST_DZ_RX:
         delta_p = 0.0
+    else:
+        delta_p = np.sign(delta_p) * (abs(delta_p) - WRIST_DZ_RX)
     wrist_x = float(np.clip(-delta_p * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
     # ── Wrist Y-rotation (yaw from index↔pinky depth skew) ──────────────
@@ -302,7 +318,7 @@ def _update(data:     mujoco.MjData,
     if _yaw_ref_angle is None:
         _yaw_ref_angle = raw_yaw
         _yaw_calib_count = 1
-    elif _yaw_calib_count < 15:
+    elif _yaw_calib_count < 40:
         err_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
         _yaw_ref_angle += 0.2 * err_y
         _yaw_calib_count += 1
@@ -312,6 +328,8 @@ def _update(data:     mujoco.MjData,
     delta_y = float(yaw_f(np.array([delta_y]))[0])
     if abs(delta_y) < WRIST_DZ_RY:
         delta_y = 0.0
+    else:
+        delta_y = np.sign(delta_y) * (abs(delta_y) - WRIST_DZ_RY)
     wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
     # Decouple: shrink Rz toward zero when Ry is active (kills cross-talk)
@@ -400,6 +418,7 @@ _pitch_ref_angle = None
 _pitch_calib_count = 0
 _yaw_ref_angle = None
 _yaw_calib_count = 0
+_last_hand_time = 0.0
 _frame_q = None
 _show_counter = 0
 _SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)

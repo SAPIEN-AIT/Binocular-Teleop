@@ -27,22 +27,22 @@
       <geom name="bottle_body" type="box"
             size="0.060 0.044 0.078"
             pos="0 0 0" rgba="0.2 0.55 0.2 0.8"
-            mass="0.30" friction="1.5 0.05 0.001"/>
+            mass="0.05" friction="2 0.05 0.001" condim="4"/>
       <!-- Shoulder (URDF box 1.42×0.54×1.42 at y=1.8) -->
       <geom name="bottle_shoulder" type="box"
             size="0.036 0.036 0.014"
             pos="0 0 0.09" rgba="0.2 0.55 0.2 0.8"
-            mass="0.05" friction="1.5 0.05 0.001"/>
+            mass="0.01" friction="2 0.05 0.001" condim="4"/>
       <!-- Neck (URDF cylinder r=0.40 l=1.0 at y=2.55) -->
       <geom name="bottle_neck" type="cylinder"
             size="0.020 0.025"
             pos="0 0 0.128" rgba="0.2 0.55 0.2 0.8"
-            mass="0.03" friction="1.5 0.05 0.001"/>
+            mass="0.005" friction="2 0.05 0.001" condim="4"/>
       <!-- Rim (URDF cylinder r=0.60 l=0.3 at y=2.8) -->
       <geom name="bottle_rim" type="cylinder"
             size="0.030 0.008"
             pos="0 0 0.14" rgba="0.7 0.1 0.1 1.0"
-            mass="0.01"/>
+            mass="0.005" condim="4"/>
     </body>
   </worldbody>
 
