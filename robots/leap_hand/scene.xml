@@ -20,29 +20,25 @@
             contype="0" conaffinity="0"/>
     </body>
 
-    <!-- Bottle (converted from bottle.urdf, scale=0.05, URDF-Y → MuJoCo-Z) -->
-    <body name="bottle" pos="0.05 0.3 0.078">
+    <!-- Bottle (×2 from previous) -->
+    <body name="bottle" pos="0.05 0.3 0.094">
       <freejoint name="bottle_free"/>
-      <!-- Main body (URDF box 2.42×3.10×1.77 at y=0) -->
       <geom name="bottle_body" type="box"
-            size="0.060 0.044 0.078"
+            size="0.044 0.036 0.094"
             pos="0 0 0" rgba="0.2 0.55 0.2 0.8"
-            mass="0.05" friction="2 0.05 0.001" condim="4"/>
-      <!-- Shoulder (URDF box 1.42×0.54×1.42 at y=1.8) -->
+            mass="0.03" friction="2 0.05 0.001" condim="4"/>
       <geom name="bottle_shoulder" type="box"
-            size="0.036 0.036 0.014"
-            pos="0 0 0.09" rgba="0.2 0.55 0.2 0.8"
-            mass="0.01" friction="2 0.05 0.001" condim="4"/>
-      <!-- Neck (URDF cylinder r=0.40 l=1.0 at y=2.55) -->
-      <geom name="bottle_neck" type="cylinder"
-            size="0.020 0.025"
-            pos="0 0 0.128" rgba="0.2 0.55 0.2 0.8"
+            size="0.032 0.032 0.016"
+            pos="0 0 0.108" rgba="0.2 0.55 0.2 0.8"
             mass="0.005" friction="2 0.05 0.001" condim="4"/>
-      <!-- Rim (URDF cylinder r=0.60 l=0.3 at y=2.8) -->
+      <geom name="bottle_neck" type="cylinder"
+            size="0.024 0.030"
+            pos="0 0 0.154" rgba="0.2 0.55 0.2 0.8"
+            mass="0.003" friction="2 0.05 0.001" condim="4"/>
       <geom name="bottle_rim" type="cylinder"
-            size="0.030 0.008"
-            pos="0 0 0.14" rgba="0.7 0.1 0.1 1.0"
-            mass="0.005" condim="4"/>
+            size="0.036 0.010"
+            pos="0 0 0.168" rgba="0.7 0.1 0.1 1.0"
+            mass="0.002" condim="4"/>
     </body>
   </worldbody>
 

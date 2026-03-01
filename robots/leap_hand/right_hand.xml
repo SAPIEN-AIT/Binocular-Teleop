@@ -64,7 +64,8 @@ Naming Conventions
 
 <mujoco model="leap_rh">
   <compiler angle="radian" meshdir="./assets/"/>
-  <option integrator="implicitfast" cone="elliptic" impratio="100"/>
+  <option integrator="implicitfast" cone="elliptic" impratio="100"
+          noslip_iterations="20"/>
 
   <!-- mesh assets -->
   <asset>
