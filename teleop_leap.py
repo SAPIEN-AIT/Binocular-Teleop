@@ -66,6 +66,7 @@ DEPTH_MIN_M  = 0.20
 DEPTH_MAX_M  = 0.90
 DEPTH_MID_M  = 0.45    # neutral depth → hand sits at START_Y
 DEPTH_SCALE  = 3.0     # m of sim-Y movement per m of depth change (5× previous)
+TRANS_SCALE  = 1.5     # global translation gain (+50%)
 START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
 START_Z      = 0.30    # initial sim Z (height) of the hand proxy
 
@@ -76,8 +77,10 @@ EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for y
 # Rz = roll  from knuckle line (INDEX_MCP → RING_MCP)
 # Rx = pitch from wrist→middle-MCP tilt (uses MediaPipe .z depth)
 # Ry = yaw   from index↔pinky depth skew (uses MediaPipe .z depth)
-WRIST_SCALE    = 2.0    # gain on detected angle delta (shared X/Y/Z)
-WRIST_DEADZONE = 0.10   # rad (~6°) — noise below this ignored
+WRIST_SCALE    = 2.0    # gain on detected angle delta (shared X/Y/Z)  [-20%]
+WRIST_DZ_RX    = 0.03   # rad (~7°) — deadzone pitch
+WRIST_DZ_RY    = 0.12   # rad (~7°) — deadzone yaw
+WRIST_DZ_RZ    = 0.10   # rad (~6°) — deadzone roll
 WRIST_MAX_RAD  = 1.6    # max clamp
 RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 
@@ -208,8 +211,8 @@ def _update(data:     mujoco.MjData,
     _palm_ids = (0, 5, 9, 13, 17)  # wrist, index/middle/ring/pinky MCP
     u_w = sum(lm_l[i].x for i in _palm_ids) / len(_palm_ids) * w
     v_w = sum(lm_l[i].y for i in _palm_ids) / len(_palm_ids) * h
-    sim_x = -(u_w - cam.cx) / cam.fx * START_Y
-    sim_z =  START_Z - (v_w - cam.cy) / cam.fy * START_Y
+    sim_x = -(u_w - cam.cx) / cam.fx * START_Y * TRANS_SCALE
+    sim_z =  START_Z + (-(v_w - cam.cy) / cam.fy * START_Y) * TRANS_SCALE
 
     # ── Depth axis (sim Y): stereo triangulation or fixed ─────────────────
     sim_y      = START_Y
@@ -231,9 +234,9 @@ def _update(data:     mujoco.MjData,
                                       depth_max_m=DEPTH_MAX_M)
             if p3d is not None:
                 x_m, y_m, z_m = p3d
-                sim_x = -x_m
-                sim_y = START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE
-                sim_z = START_Z - y_m
+                sim_x = -x_m * TRANS_SCALE
+                sim_y = START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE * TRANS_SCALE
+                sim_z = START_Z + (-y_m) * TRANS_SCALE
                 depth_cm = z_m * 100
                 hud_mode   = "STEREO [L+R]"
                 hud_col    = (0, 220, 0)
@@ -263,9 +266,9 @@ def _update(data:     mujoco.MjData,
     delta = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
     delta = float(np.clip(delta, -0.9, 0.9))
     delta = float(orient_f(np.array([delta]))[0])
-    if abs(delta) < WRIST_DEADZONE:
+    if abs(delta) < WRIST_DZ_RZ:
         delta = 0.0
-    wrist_z = float(np.clip(delta * WRIST_SCALE * 0.3, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+    wrist_z = float(np.clip(delta * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
     # ── Wrist X-rotation (pitch from wrist→middle-MCP tilt) ─────────────
     mid_mcp = lm_l[9]
@@ -285,9 +288,9 @@ def _update(data:     mujoco.MjData,
     delta_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
     delta_p = float(np.clip(delta_p, -0.9, 0.9))
     delta_p = float(pitch_f(np.array([delta_p]))[0])
-    if abs(delta_p) < WRIST_DEADZONE:
+    if abs(delta_p) < WRIST_DZ_RX:
         delta_p = 0.0
-    wrist_x = float(np.clip(delta_p * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+    wrist_x = float(np.clip(-delta_p * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
     # ── Wrist Y-rotation (yaw from index↔pinky depth skew) ──────────────
     idx_mcp_y = lm_l[5]
@@ -307,7 +310,7 @@ def _update(data:     mujoco.MjData,
     delta_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
     delta_y = float(np.clip(delta_y, -0.9, 0.9))
     delta_y = float(yaw_f(np.array([delta_y]))[0])
-    if abs(delta_y) < WRIST_DEADZONE:
+    if abs(delta_y) < WRIST_DZ_RY:
         delta_y = 0.0
     wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
