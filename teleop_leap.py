@@ -37,7 +37,7 @@ from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 0       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
-N_SUBSTEPS   = 8       # physics sub-steps per vision frame (8 × 2ms = 16ms, ~80% tracking)
+N_SUBSTEPS   = 12      # physics sub-steps per vision frame (12 × 2ms = 24ms, better contact stability)
 
 # ── Mode toggle ───────────────────────────────────────────────────────────────
 # False = monocular (left frame only, Y fixed) → tune IK first.
@@ -69,7 +69,7 @@ DEPTH_SCALE  = 3.0     # m of sim-Y movement per m of depth change (5× previous
 TRANS_SCALE  = 2.5
      # global translation gain (+50%)
 START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
-START_Z      = 0.30    # initial sim Z (height) of the hand proxy
+START_Z      = 0.45    # initial sim Z (height) of the hand proxy
 
 # Epipolar constraint — only checked when STEREO_DEPTH = True
 EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for your unit)
@@ -83,6 +83,8 @@ WRIST_DZ_RX    = 0.03   # rad (~7°) — deadzone pitch
 WRIST_DZ_RY    = 0.08   # rad (~7°) — deadzone yaw
 WRIST_DZ_RZ    = 0.12   # rad (~6°) — deadzone roll
 WRIST_MAX_RAD  = 1.6    # max clamp
+RY_POS_BOOST   = 1.8    # compensate MediaPipe .z asymmetry: positive yaw harder to reach
+RY_NEG_BOOST   = 5    # boost negative yaw sensitivity to match positive side
 RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 
 # One Euro Filters for wrist angles (1-dim each)
@@ -173,11 +175,21 @@ def _update(data:     mujoco.MjData,
     If stereo fails on a frame, the last good position is kept but fingers
     still update — no frame is ever fully dropped.
     """
-    global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count, _last_hand_time
+    global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count, _last_hand_time, _calibrate_flag
     import time as _time
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
+
+    # ── Reset (touche R) ──────────────────────────────────────────────────
+    if _reset_flag is not None and _reset_flag.value:
+        _reset_flag.value = 0
+        _wrist_ref_angle = None; _wrist_calib_count = 0
+        _pitch_ref_angle = None; _pitch_calib_count = 0
+        _yaw_ref_angle   = None; _yaw_calib_count  = 0
+        orient_f.reset(); pitch_f.reset(); yaw_f.reset()
+        _init_hand(model, data)
+        print("[RESET] Hand position & calibration reset (R key)")
 
     h, w, _ = frame_l.shape
     res_l, res_r = tracker.process(frame_l, frame_r)
@@ -188,12 +200,6 @@ def _update(data:     mujoco.MjData,
         holding = elapsed < HOLD_POSE_SEC and _last_hand_time > 0
 
         if not holding:
-            _wrist_ref_angle = None
-            _wrist_calib_count = 0
-            _pitch_ref_angle = None
-            _pitch_calib_count = 0
-            _yaw_ref_angle = None
-            _yaw_calib_count = 0
             orient_f.reset()
             pitch_f.reset()
             yaw_f.reset()
@@ -216,6 +222,8 @@ def _update(data:     mujoco.MjData,
             _show(frame_l)
         return
 
+    _last_hand_time = _time.monotonic()
+
     lm_l = res_l.multi_hand_landmarks[0].landmark
     cam   = geo.ZED2I
 
@@ -223,7 +231,7 @@ def _update(data:     mujoco.MjData,
     _palm_ids = (0, 5, 9, 13, 17)  # wrist, index/middle/ring/pinky MCP
     u_w = sum(lm_l[i].x for i in _palm_ids) / len(_palm_ids) * w
     v_w = sum(lm_l[i].y for i in _palm_ids) / len(_palm_ids) * h
-    sim_x = -(u_w - cam.cx) / cam.fx * START_Y * TRANS_SCALE
+    sim_x = (u_w - cam.cx) / cam.fx * START_Y * TRANS_SCALE
     sim_z =  START_Z + (-(v_w - cam.cy) / cam.fy * START_Y) * TRANS_SCALE
 
     # ── Depth axis (sim Y): stereo triangulation or fixed ─────────────────
@@ -258,101 +266,102 @@ def _update(data:     mujoco.MjData,
         else:
             hud_detail = f"epi REJECTED err={epi_err:.0f}px"
 
-    # ── Mocap position ────────────────────────────────────────────────────
-    raw_pos = np.array([sim_x, sim_y, sim_z])
-    data.mocap_pos[mid] = pos_f(raw_pos)
-
-    # ── Wrist Z-rotation (pure Rz on mocap_quat) ────────────────────────
+    # ── Compute raw wrist angles ────────────────────────────────────────
     idx_mcp  = lm_l[5]
     ring_mcp = lm_l[13]
     raw_angle = np.arctan2(ring_mcp.y - idx_mcp.y, ring_mcp.x - idx_mcp.x)
 
-    if _wrist_ref_angle is None:
-        _wrist_ref_angle = raw_angle
-        _wrist_calib_count = 1
-    elif _wrist_calib_count < 40:
-        err = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
-        _wrist_ref_angle += 0.2 * err
-        _wrist_calib_count += 1
-
-    delta = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
-    delta = float(np.clip(delta, -0.9, 0.9))
-    delta = float(orient_f(np.array([delta]))[0])
-    if abs(delta) < WRIST_DZ_RZ:
-        delta = 0.0
-    else:
-        delta = np.sign(delta) * (abs(delta) - WRIST_DZ_RZ)
-    wrist_z = float(np.clip(delta * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
-
-    # ── Wrist X-rotation (pitch from wrist→middle-MCP tilt) ─────────────
-    mid_mcp = lm_l[9]
+    mid_mcp  = lm_l[9]
     wrist_lm = lm_l[0]
     dy_p = mid_mcp.y - wrist_lm.y
     dz_p = mid_mcp.z - wrist_lm.z
     raw_pitch = np.arctan2(dz_p, dy_p)
 
-    if _pitch_ref_angle is None:
-        _pitch_ref_angle = raw_pitch
-        _pitch_calib_count = 1
-    elif _pitch_calib_count < 40:
-        err_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
-        _pitch_ref_angle += 0.2 * err_p
-        _pitch_calib_count += 1
-
-    delta_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
-    delta_p = float(np.clip(delta_p, -0.9, 0.9))
-    delta_p = float(pitch_f(np.array([delta_p]))[0])
-    if abs(delta_p) < WRIST_DZ_RX:
-        delta_p = 0.0
-    else:
-        delta_p = np.sign(delta_p) * (abs(delta_p) - WRIST_DZ_RX)
-    wrist_x = float(np.clip(-delta_p * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
-
-    # ── Wrist Y-rotation (yaw from index↔pinky depth skew) ──────────────
     idx_mcp_y = lm_l[5]
     pky_mcp_y = lm_l[17]
     dx_y = pky_mcp_y.x - idx_mcp_y.x
     dz_y = pky_mcp_y.z - idx_mcp_y.z
-    raw_yaw = np.arctan2(dz_y, dx_y)
+    raw_yaw = dz_y / max(abs(dx_y), 0.01)
 
-    if _yaw_ref_angle is None:
-        _yaw_ref_angle = raw_yaw
-        _yaw_calib_count = 1
-    elif _yaw_calib_count < 40:
-        err_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
-        _yaw_ref_angle += 0.2 * err_y
-        _yaw_calib_count += 1
+    # ── Press A → snapshot current orientation as reference ───────────
+    if _calibrate_flag:
+        _wrist_ref_angle = raw_angle
+        _pitch_ref_angle = raw_pitch
+        _yaw_ref_angle   = raw_yaw
+        orient_f.reset()
+        pitch_f.reset()
+        yaw_f.reset()
+        pos_f.reset()
+        joint_f.reset()
+        _calibrate_flag = False
+        print("[CALIB] Orientation de référence capturée.")
 
-    delta_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
-    delta_y = float(np.clip(delta_y, -0.9, 0.9))
-    delta_y = float(yaw_f(np.array([delta_y]))[0])
-    if abs(delta_y) < WRIST_DZ_RY:
-        delta_y = 0.0
+    # ── Before calibration: hand frozen at start pose ─────────────────
+    if _wrist_ref_angle is None:
+        wrist_x = wrist_y = wrist_z = wrist_z_raw = 0.0
     else:
-        delta_y = np.sign(delta_y) * (abs(delta_y) - WRIST_DZ_RY)
-    wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+        # ── Mocap position (only after calibration) ──────────────────
+        raw_pos = np.array([sim_x, sim_y, sim_z])
+        data.mocap_pos[mid] = pos_f(raw_pos)
 
-    # Decouple: shrink Rz toward zero when Ry is active (kills cross-talk)
-    wrist_z_raw = wrist_z
-    reduction = RZ_RY_DECOUPLE * abs(wrist_y)
-    if abs(wrist_z) > reduction:
-        wrist_z = wrist_z - np.sign(wrist_z) * reduction
-    else:
-        wrist_z = 0.0
+        # Roll (Rz)
+        delta = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        delta = -delta
+        delta = float(np.clip(delta, -0.9, 0.9))
+        delta = float(orient_f(np.array([delta]))[0])
+        if abs(delta) < WRIST_DZ_RZ:
+            delta = 0.0
+        else:
+            delta = np.sign(delta) * (abs(delta) - WRIST_DZ_RZ)
+        wrist_z = float(np.clip(delta * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
-    # ── Compose Ry * Rz * Rx * BASE_QUAT  (Ry↔Rz swapped in MuJoCo) ────
-    half_z = wrist_y / 2.0      # yaw detection → MuJoCo Z-axis
-    q_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
-    half_y = wrist_z / 2.0      # roll detection → MuJoCo Y-axis
-    q_y = np.array([np.cos(half_y), 0.0, np.sin(half_y), 0.0])
-    half_x = wrist_x / 2.0
-    q_x = np.array([np.cos(half_x), np.sin(half_x), 0.0, 0.0])
-    data.mocap_quat[mid] = _quat_mul(q_y, _quat_mul(q_z, _quat_mul(q_x, BASE_QUAT)))
+        # Pitch (Rx)
+        delta_p = (raw_pitch - _pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        delta_p = delta_p
+        delta_p = float(np.clip(delta_p, -0.9, 0.9))
+        delta_p = float(pitch_f(np.array([delta_p]))[0])
+        if abs(delta_p) < WRIST_DZ_RX:
+            delta_p = 0.0
+        else:
+            delta_p = np.sign(delta_p) * (abs(delta_p) - WRIST_DZ_RX)
+        wrist_x = float(np.clip(-delta_p * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
-    # ── Direct angle retargeting (always from left camera) ────────────────
-    q_raw    = ik.retarget(None, lm_l)
-    q_smooth = joint_f(q_raw)
-    data.ctrl[:] = q_smooth
+        # Yaw (Ry) — boost positive side to compensate MediaPipe .z asymmetry
+        delta_y = (raw_yaw - _yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
+        delta_y = -delta_y
+        if delta_y > 0:
+            delta_y *= RY_POS_BOOST
+        else:
+            delta_y *= RY_NEG_BOOST
+        delta_y = float(np.clip(delta_y, -0.9, 0.9))
+        delta_y = float(yaw_f(np.array([delta_y]))[0])
+        if abs(delta_y) < WRIST_DZ_RY:
+            delta_y = 0.0
+        else:
+            delta_y = np.sign(delta_y) * (abs(delta_y) - WRIST_DZ_RY)
+        wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+        # Decouple: shrink Rz toward zero when Ry is active (kills cross-talk)
+        wrist_z_raw = wrist_z
+        reduction = RZ_RY_DECOUPLE * abs(wrist_y)
+        if abs(wrist_z) > reduction:
+            wrist_z = wrist_z - np.sign(wrist_z) * reduction
+        else:
+            wrist_z = 0.0
+
+        # Compose Ry * Rz * Rx * BASE_QUAT  (Ry↔Rz swapped in MuJoCo)
+        half_z = wrist_y / 2.0
+        q_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
+        half_y = wrist_z / 2.0
+        q_y = np.array([np.cos(half_y), 0.0, np.sin(half_y), 0.0])
+        half_x = wrist_x / 2.0
+        q_x = np.array([np.cos(half_x), np.sin(half_x), 0.0, 0.0])
+        data.mocap_quat[mid] = _quat_mul(q_y, _quat_mul(q_z, _quat_mul(q_x, BASE_QUAT)))
+
+        # ── Direct angle retargeting (only after calibration) ────────
+        q_raw    = ik.retarget(None, lm_l)
+        q_smooth = joint_f(q_raw)
+        data.ctrl[:] = q_smooth
 
     if SHOW_CAMERA:
         tracker.draw_landmarks(frame_l, res_l)
@@ -363,6 +372,15 @@ def _update(data:     mujoco.MjData,
         if hud_detail:
             cv2.putText(frame_l, hud_detail, (20, 62),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_col, 1)
+
+        # Calibration status banner
+        if _wrist_ref_angle is None:
+            calib_txt = "NON CALIBRE — Appuyez sur A (MuJoCo)"
+            cv2.putText(frame_l, calib_txt, (20, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        else:
+            cv2.putText(frame_l, "CALIBRE (A = recalibrer)", (20, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 1)
 
         # Top-right: depth readout (large)
         if depth_cm is not None:
@@ -413,12 +431,11 @@ def _update(data:     mujoco.MjData,
 
 
 _wrist_ref_angle = None
-_wrist_calib_count = 0
 _pitch_ref_angle = None
-_pitch_calib_count = 0
 _yaw_ref_angle = None
-_yaw_calib_count = 0
 _last_hand_time = 0.0
+_calibrate_flag = False
+_reset_flag = None
 _frame_q = None
 _show_counter = 0
 _SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)
@@ -444,6 +461,14 @@ def _show(frame):
         _frame_q.put_nowait(small)
     except Exception:
         pass
+
+
+def _key_callback(keycode):
+    """MuJoCo viewer key callback: press A to (re-)calibrate wrist orientation."""
+    global _calibrate_flag
+    if keycode == 65:  # GLFW_KEY_A
+        _calibrate_flag = True
+        print("[CALIB] Touche A détectée — calibration au prochain frame avec main visible.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -481,17 +506,19 @@ def main():
         from _camera_viewer import viewer_loop
         ctx = _mp.get_context("spawn")
         _frame_q = ctx.Queue(maxsize=2)
-        viewer_proc = ctx.Process(target=viewer_loop, args=(_frame_q,), daemon=True)
+        _reset_flag = ctx.Value('i', 0)
+        viewer_proc = ctx.Process(target=viewer_loop, args=(_frame_q, _reset_flag), daemon=True)
         viewer_proc.start()
 
     print("─" * 60)
     print("  Binocular Hand Teleoperation (Direct Angle Retargeting)")
     print("  Move your right hand in front of the ZED camera.")
+    print("  Press  A  dans le viewer MuJoCo pour calibrer l'orientation.")
     print("  Press  Q  in the camera window  or  ESC  in the")
     print("  MuJoCo viewer to quit.")
     print("─" * 60)
 
-    with mujoco.viewer.launch_passive(model, data) as v:
+    with mujoco.viewer.launch_passive(model, data, key_callback=_key_callback) as v:
         while v.is_running():
             _update(data, zed, tracker, ik, pos_f, joint_f, orient_f, pitch_f, yaw_f, mid)
 
