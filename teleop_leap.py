@@ -37,7 +37,7 @@ from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 0       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
-N_SUBSTEPS   = 12      # physics sub-steps per vision frame (12 × 2ms = 24ms, better contact stability)
+N_SUBSTEPS   = 16       # lighter physics load for better FPS/thermals
 
 # ── Mode toggle ───────────────────────────────────────────────────────────────
 # False = monocular (left frame only, Y fixed) → tune IK first.
@@ -65,9 +65,8 @@ Z_SCALE      = 0.3     # legacy — no longer used
 DEPTH_MIN_M  = 0.20
 DEPTH_MAX_M  = 0.90
 DEPTH_MID_M  = 0.45    # neutral depth → hand sits at START_Y
-DEPTH_SCALE  = 3.0     # m of sim-Y movement per m of depth change (5× previous)
-TRANS_SCALE  = 2.5
-     # global translation gain (+50%)
+DEPTH_SCALE  = 2.0     # m of sim-Y movement per m of depth change
+TRANS_SCALE  = 2.0     # global translation gain (higher = more movement)
 START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
 START_Z      = 0.45    # initial sim Z (height) of the hand proxy
 
@@ -82,7 +81,8 @@ WRIST_SCALE    = 2.0    # gain on detected angle delta (shared X/Y/Z)  [-20%]
 WRIST_DZ_RX    = 0.03   # rad (~7°) — deadzone pitch
 WRIST_DZ_RY    = 0.08   # rad (~7°) — deadzone yaw
 WRIST_DZ_RZ    = 0.12   # rad (~6°) — deadzone roll
-WRIST_MAX_RAD  = 1.6    # max clamp
+WRIST_MAX_RAD  = 2.0    # max clamp (~45°, reduced to avoid vibration at limits)
+MOCAP_MAX_STEP = 0.010  # max position change per frame (m) — prevents teleportation
 RY_POS_BOOST   = 1.8    # compensate MediaPipe .z asymmetry: positive yaw harder to reach
 RY_NEG_BOOST   = 5    # boost negative yaw sensitivity to match positive side
 RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
@@ -188,8 +188,11 @@ def _update(data:     mujoco.MjData,
         _pitch_ref_angle = None; _pitch_calib_count = 0
         _yaw_ref_angle   = None; _yaw_calib_count  = 0
         orient_f.reset(); pitch_f.reset(); yaw_f.reset()
+        joint_f.reset()
+        data.ctrl[:] = 0.0
+        data.qvel[:] = 0.0
         _init_hand(model, data)
-        print("[RESET] Hand position & calibration reset (R key)")
+        print("[RESET] Hand position, fingers & calibration reset (R key)")
 
     h, w, _ = frame_l.shape
     res_l, res_r = tracker.process(frame_l, frame_r)
@@ -302,7 +305,12 @@ def _update(data:     mujoco.MjData,
     else:
         # ── Mocap position (only after calibration) ──────────────────
         raw_pos = np.array([sim_x, sim_y, sim_z])
-        data.mocap_pos[mid] = pos_f(raw_pos)
+        new_pos = pos_f(raw_pos)
+        delta_pos = new_pos - data.mocap_pos[mid]
+        dist = np.linalg.norm(delta_pos)
+        if dist > MOCAP_MAX_STEP:
+            new_pos = data.mocap_pos[mid] + delta_pos * (MOCAP_MAX_STEP / dist)
+        data.mocap_pos[mid] = new_pos
 
         # Roll (Rz)
         delta = (raw_angle - _wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
@@ -339,7 +347,7 @@ def _update(data:     mujoco.MjData,
             delta_y = 0.0
         else:
             delta_y = np.sign(delta_y) * (abs(delta_y) - WRIST_DZ_RY)
-        wrist_y = float(np.clip(delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+        wrist_y = float(np.clip(-delta_y * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
         # Decouple: shrink Rz toward zero when Ry is active (kills cross-talk)
         wrist_z_raw = wrist_z
@@ -349,18 +357,27 @@ def _update(data:     mujoco.MjData,
         else:
             wrist_z = 0.0
 
-        # Compose Ry * Rz * Rx * BASE_QUAT  (Ry↔Rz swapped in MuJoCo)
-        half_z = wrist_y / 2.0
-        q_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
-        half_y = wrist_z / 2.0
-        q_y = np.array([np.cos(half_y), 0.0, np.sin(half_y), 0.0])
+        # Incremental rotation: small per-axis quats applied to BASE_QUAT
+        # in the body-local frame (avoids gimbal lock)
         half_x = wrist_x / 2.0
-        q_x = np.array([np.cos(half_x), np.sin(half_x), 0.0, 0.0])
-        data.mocap_quat[mid] = _quat_mul(q_y, _quat_mul(q_z, _quat_mul(q_x, BASE_QUAT)))
+        dq_x = np.array([np.cos(half_x), np.sin(half_x), 0.0, 0.0])
+        half_y = wrist_z / 2.0
+        dq_y = np.array([np.cos(half_y), 0.0, np.sin(half_y), 0.0])
+        half_z = wrist_y / 2.0
+        dq_z = np.array([np.cos(half_z), 0.0, 0.0, np.sin(half_z)])
+        # Apply in body-local frame: BASE * dq_x * dq_y * dq_z
+        q = _quat_mul(BASE_QUAT, dq_x)
+        q = _quat_mul(q, dq_y)
+        q = _quat_mul(q, dq_z)
+        q = q / np.linalg.norm(q)
+        data.mocap_quat[mid] = q
 
         # ── Direct angle retargeting (only after calibration) ────────
         q_raw    = ik.retarget(None, lm_l)
         q_smooth = joint_f(q_raw)
+        for i in range(data.model.nu):
+            lo, hi = data.model.actuator_ctrlrange[i]
+            q_smooth[i] = np.clip(q_smooth[i], lo, hi)
         data.ctrl[:] = q_smooth
 
     if SHOW_CAMERA:
@@ -438,8 +455,8 @@ _calibrate_flag = False
 _reset_flag = None
 _frame_q = None
 _show_counter = 0
-_SHOW_EVERY = 3        # send 1 frame out of 3 to the viewer (saves CPU + queue bandwidth)
-_VIEWER_SCALE = 0.5    # downscale factor for the viewer frame
+_SHOW_EVERY = 5        # send 1 frame out of 5 to the viewer
+_VIEWER_SCALE = 0.35   # stronger downscale for lower CPU/GPU load
 
 
 def _show(frame):

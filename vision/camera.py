@@ -19,9 +19,11 @@ class ZEDCamera:
         self.cap = cv2.VideoCapture(camera_id)
         self.y_offset = y_offset
 
-        # 2. Force Side-by-Side Resolution (2560x720)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        # 2. Lower capture load for better FPS/thermals (SBS 1280x720 => 640x720 per eye)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self.cap.isOpened():
             print(f"Warning: Camera {camera_id} failed to open.")
