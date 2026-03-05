@@ -37,5 +37,4 @@ MUJOCO_LOG.TXT
 *.bak
 *.tmp
 
-# Demo data (large HDF5 files)
-data/*.h5
+
