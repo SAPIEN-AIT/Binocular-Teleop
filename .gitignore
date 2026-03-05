@@ -16,9 +16,23 @@ env/
 .DS_Store
 .AppleDouble
 .LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+MUJOCO_LOG.TXT
+
+# Jupyter
+.ipynb_checkpoints/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Misc
+*.bak
+*.tmp
