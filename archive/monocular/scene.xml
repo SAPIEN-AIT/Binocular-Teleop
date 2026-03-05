@@ -1,0 +1,82 @@
+<mujoco model="teleop_grasp">
+    <include file="../leap_hand/right_hand.xml"/>
+
+    <!--
+    COMPILER: must live in the main scene file (not the included one).
+    When right_hand.xml is included, its own compiler is ignored.
+    meshdir tells MuJoCo where to find .obj mesh files,
+    relative to THIS file (scene.xml in monocular/).
+    -->
+    <compiler angle="radian" meshdir="../leap_hand/assets/"/>
+
+    <option timestep="0.002" gravity="0 0 -9.81"/>
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+        <rgba haze="0.15 0.25 0.35 1"/>
+        <global azimuth="35" elevation="-50"/>
+    </visual>
+
+    <asset> 
+        <texture type="skybox" builtin="gradient"
+            rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+        <texture type="2d" name="groundplane" builtin="checker"
+            rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" width="300" height="300"/>
+        <material name="groundplane" texture="groundplane"
+            texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+        <material name="object_red" rgba="0.8 0.1 0.1 1"/>
+    </asset>
+
+    <!--
+  WORLDBODY: the root of the scene. Structure:
+    worldbody
+    ├── light
+    ├── geom floor     (static, no body wrapper needed)
+    ├── body "box"     (free-floating rigid object)
+    │   ├── freejoint  (6DOF: x y z + roll pitch yaw)
+    │   └── geom       (shape = visual + collision combined)
+    └── [LEAP bodies injected by the include]
+  -->
+    <!--
+    EQUALITY: weld constraint ties the mocap body to the palm.
+    body1 = the mocap body we control from Python.
+    body2 = the palm of the LEAP hand.
+    Result: wherever we move hand_mount, the palm follows.
+    -->
+    <equality>
+        <weld name="hand_weld" body1="hand_mount" body2="palm" relpose="0 0 0 1 0 0 0"/>
+    </equality>
+
+    <worldbody>
+        <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+
+        <!-- Static floor: plane is infinite, size only affects texture -->
+        <geom name="floor" type="plane" size="1 1 0.05" material="groundplane"/>
+
+        <!--
+        MOCAP BODY: a kinematic anchor we move from Python.
+        mocap="true" means it is NOT simulated — it is driven directly.
+        The weld constraint above makes the palm track this body.
+        pos/quat here set the starting pose of the hand.
+        -->
+        <body name="hand_mount" mocap="true" pos="0 0 1" quat="1 0 0 0"/>
+
+
+        <!--
+        Graspable box:
+        pos  = (x=0 centered, y=0, z=0.06)
+               Palm is at z=0.1, fingertips reach ~z=0.02.
+               z=0.06 puts the box right in the palm/finger zone.
+               Adjust z up/down if it needs to move toward palm or floor.
+        size = half-extents: 0.025 = 5cm cube total (a bit bigger)
+        -->
+        <body name="box" pos="0 0 0.025">
+            <freejoint/>
+            <geom type="box" size="0.025 0.025 0.025"
+                  mass="0.5" friction="1.5 0.05 0.001"
+                  material="object_red"/>
+        </body>
+
+    </worldbody>
+
+</mujoco>
