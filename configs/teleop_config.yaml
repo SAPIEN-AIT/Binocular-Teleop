@@ -33,3 +33,9 @@ wrist_control:
 hold_pose_sec: 1.0     # keep last pose when hand disappears briefly
 epipolar_tol: 40       # max vertical pixel error for stereo match
 show_camera: false      # display camera feed in a separate window
+
+wandb:
+  enabled: false         # set to true to log demos to Weights & Biases
+  project: "binocular-teleop"
+  entity: null           # your W&B username or team (null = default)
+  tags: []               # e.g. ["right-hand", "lab-table"]

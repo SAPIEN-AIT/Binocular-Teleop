@@ -85,6 +85,22 @@ def main() -> None:
     save_dir = _ROOT / "data"
     logger = DataLogger(save_dir=save_dir)
 
+    # ── Weights & Biases (optional) ──────────────────────────────────────────
+    wb_cfg = config.get("wandb", {})
+    if wb_cfg.get("enabled", False):
+        logger.init_wandb(
+            project=wb_cfg.get("project", "binocular-teleop"),
+            entity=wb_cfg.get("entity") or None,
+            tags=wb_cfg.get("tags", []),
+            config={                            # snapshot the full config
+                "hardware": hw,
+                "physics": phys,
+                "workspace": ws,
+                "wrist_control": config.get("wrist_control", {}),
+                "filters": config.get("filters", {}),
+            },
+        )
+
     # ── Camera viewer (separate process) ─────────────────────────────────────
     frame_q = None
     viewer_proc = None
@@ -275,6 +291,11 @@ def main() -> None:
         viewer_proc.join(timeout=3)
     zed.close()
     cv2.destroyAllWindows()
+
+    # Finish W&B run if one was started
+    if logger._wandb_run is not None:
+        import wandb
+        wandb.finish()
 
 
 if __name__ == "__main__":
