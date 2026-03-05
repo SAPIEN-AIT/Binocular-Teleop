@@ -1,13 +1,13 @@
-# scripts/teleop_leap.py
+# scripts/collect_data.py
 """
-LEAP Hand teleoperation — clean entry point.
+Data collection script — enhanced version of teleop_leap.py.
 
-Pipeline (≈30 Hz):
-  ZED SBS frame → MediaPipe stereo tracking → stereo 3-D back-projection
-  → LeapTeleopInterface (position + orientation + fingers) → MuJoCo viewer
+Same pipeline as teleop_leap.py, plus:
+  - Press 'S' in the MuJoCo viewer to Start/Stop recording.
+  - Each recording session is auto-saved as ``data/demo_YYYYMMDD_HHMMSS.h5``.
 
 Run with mjpython on macOS:
-    mjpython scripts/teleop_leap.py
+    mjpython scripts/collect_data.py
 """
 
 import multiprocessing as _mp
@@ -24,6 +24,7 @@ import src.vision.geometry as geo
 from src.vision.camera import ZEDCamera
 from src.vision.detectors import StereoHandTracker
 from src.robots.leap_hand.teleop_interface import LeapTeleopInterface
+from src.utils.data_logger import DataLogger
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
@@ -50,8 +51,9 @@ def main() -> None:
     EPIPOLAR_TOL  = config.get("epipolar_tol", 40)
     SHOW_CAMERA   = config.get("show_camera", True)
 
-    # ── Globals for key_callback / _show ─────────────────────────────────────
+    # ── Mutable state for key_callback ───────────────────────────────────────
     calibrate_flag = False
+    record_toggle  = False       # toggled by 'S' key
     last_hand_time = 0.0
 
     # ── Hardware init ────────────────────────────────────────────────────────
@@ -69,12 +71,15 @@ def main() -> None:
     robot = LeapTeleopInterface(model, config)
     mid = robot.mid
 
-    # Place hand at start pose
     data.mocap_pos[mid]  = np.array([0.0, START_Y, START_Z])
     data.mocap_quat[mid] = robot.base_quat.copy()
     mujoco.mj_forward(model, data)
 
-    # ── Camera viewer (separate process for macOS Cocoa compat) ──────────────
+    # ── Data logger ──────────────────────────────────────────────────────────
+    save_dir = _ROOT / "data"
+    logger = DataLogger(save_dir=save_dir)
+
+    # ── Camera viewer (separate process) ─────────────────────────────────────
     frame_q = None
     viewer_proc = None
     _show_counter = 0
@@ -109,21 +114,34 @@ def main() -> None:
         except Exception:
             pass
 
-    # ── Key callback (runs in main thread via MuJoCo) ────────────────────────
+    # ── Key callback ─────────────────────────────────────────────────────────
     def key_callback(keycode: int) -> None:
-        nonlocal calibrate_flag
-        if keycode == 65:  # 'A' key
+        nonlocal calibrate_flag, record_toggle
+        if keycode == 65:           # 'A' — calibrate
             calibrate_flag = True
+        elif keycode == 83:         # 'S' — start/stop recording
+            record_toggle = True
 
     # ── Banner ───────────────────────────────────────────────────────────────
     print("=" * 60)
-    print("  LEAP Hand Teleop — Binocular")
-    print("  Press 'A' in the MuJoCo viewer to calibrate")
+    print("  LEAP Hand Data Collection — Binocular")
+    print("  'A' = calibrate  |  'S' = start/stop recording")
+    print(f"  Demos saved to: {save_dir.resolve()}")
     print("=" * 60)
 
     # ── Main loop ────────────────────────────────────────────────────────────
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as v:
         while v.is_running():
+            # ---- Record toggle ----
+            if record_toggle:
+                record_toggle = False
+                if logger.is_recording:
+                    saved = logger.stop()
+                    if saved:
+                        print(f"[DATA] Demo saved → {saved}")
+                else:
+                    logger.start()
+
             # ---- Vision step ----
             frame_l, frame_r = zed.get_frames()
             if frame_l is None:
@@ -132,12 +150,11 @@ def main() -> None:
             h, w, _ = frame_l.shape
             res_l, res_r = tracker.process(frame_l, frame_r)
 
-            # ---- No hand detected ----
+            # ---- No hand ----
             if not res_l.multi_hand_landmarks:
                 elapsed = time.monotonic() - last_hand_time
                 holding = elapsed < HOLD_POSE_SEC and last_hand_time > 0
                 if not holding:
-                    # Reset wrist orientation to base when hand is lost
                     robot.filters["roll"].reset()
                     robot.filters["pitch"].reset()
                     robot.filters["yaw"].reset()
@@ -152,7 +169,6 @@ def main() -> None:
                     else:
                         display = frame_l
                     _show(display)
-                # Still step physics so the viewer doesn't freeze
                 for _ in range(phys["n_substeps"]):
                     mujoco.mj_step(model, data)
                 v.sync()
@@ -161,13 +177,11 @@ def main() -> None:
             last_hand_time = time.monotonic()
             lm_l = res_l.multi_hand_landmarks[0].landmark
 
-            # ---- Compute sim_pos via stereo or monocular back-projection ----
-            # Palm-centre pixel (average of wrist + 4 MCP landmarks)
+            # ---- Compute sim_pos ----
             _palm_ids = (0, 5, 9, 13, 17)
             u_w = sum(lm_l[i].x for i in _palm_ids) / len(_palm_ids) * w
             v_w = sum(lm_l[i].y for i in _palm_ids) / len(_palm_ids) * h
 
-            # Default monocular projection (fixed depth = START_Y)
             sim_x = (u_w - cam.cx) / cam.fx * START_Y * TRANS_SCALE
             sim_y = START_Y
             sim_z = START_Z + (-(v_w - cam.cy) / cam.fy * START_Y) * TRANS_SCALE
@@ -187,17 +201,13 @@ def main() -> None:
                     )
                     if p3d is not None:
                         x_m, y_m, z_m = p3d
-                        # Camera → MuJoCo mapping:
-                        #   cam X (right)   → sim -X (mirror)
-                        #   cam Z (forward) → sim  Y
-                        #   cam Y (down)    → sim -Z (invert)
                         sim_x = -x_m * TRANS_SCALE
                         sim_y = START_Y + (DEPTH_MID_M - z_m) * DEPTH_SCALE * TRANS_SCALE
                         sim_z = START_Z + (-y_m) * TRANS_SCALE
 
             sim_pos = np.array([sim_x, sim_y, sim_z])
 
-            # ---- Calibration trigger ----
+            # ---- Calibration ----
             if calibrate_flag:
                 raw_angles = robot.compute_raw_angles(lm_l)
                 robot.calibrate(raw_angles)
@@ -206,11 +216,22 @@ def main() -> None:
             # ---- Teleop step ----
             robot.update(data, lm_l, sim_pos)
 
+            # ---- Data capture (if recording) ----
+            logger.record(data.qpos, data.qvel, data.ctrl)
+
             # ---- Camera HUD ----
             if SHOW_CAMERA:
                 tracker.draw_landmarks(frame_l, res_l)
-                status = "CALIB" if robot.is_calibrated else "UNCALIB — press A"
-                col = (0, 220, 0) if robot.is_calibrated else (0, 165, 255)
+                # Status line
+                if logger.is_recording:
+                    status = f"REC [{logger.n_steps}]"
+                    col = (0, 0, 255)
+                elif robot.is_calibrated:
+                    status = "READY — press S to record"
+                    col = (0, 220, 0)
+                else:
+                    status = "UNCALIB — press A"
+                    col = (0, 165, 255)
                 cv2.putText(frame_l, status, (20, 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
                 if frame_r is not None:
@@ -226,6 +247,10 @@ def main() -> None:
             v.sync()
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
+    # Auto-save if still recording when viewer closes
+    if logger.is_recording:
+        logger.stop()
+
     if viewer_proc is not None and frame_q is not None:
         frame_q.put(None)
         viewer_proc.join(timeout=3)

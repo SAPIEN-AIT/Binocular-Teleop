@@ -27,3 +27,9 @@ wrist_control:
   max_rad: 2.0
   max_step_m: 0.010
   yaw_boost: { pos: 1.8, neg: 5.0 }
+  rz_ry_decouple: 0.6  # shrink roll when yaw is active
+
+# Misc
+hold_pose_sec: 1.0     # keep last pose when hand disappears briefly
+epipolar_tol: 40       # max vertical pixel error for stereo match
+show_camera: true      # display camera feed in a separate window

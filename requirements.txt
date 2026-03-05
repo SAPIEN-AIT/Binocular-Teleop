@@ -1,4 +1,12 @@
+#Teleop
 opencv-python
 mediapipe
 numpy
 mujoco
+pyyaml
+
+#IL
+torch          # PyTorch: For building and running the AI policy
+wandb          # Weights & Biases: For tracking training progress
+h5py           # For saving/loading large robot datasets efficiently
+matplotlib     # For plotting demo data in notebooks

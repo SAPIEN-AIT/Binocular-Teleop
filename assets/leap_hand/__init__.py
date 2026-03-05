@@ -8,12 +8,12 @@ Exports
   LeapController thin RobotController wrapper around IKRetargeter
 """
 
-from robots.leap_hand.ik_retargeting import IKRetargeter, palm_quat  # noqa: F401
+from src.robots.leap_hand.retargeter import IKRetargeter, palm_quat  # noqa: F401
 
 import os
 import numpy as np
 import mujoco
-from robots.base import RobotController
+from assets.base import RobotController
 
 
 class LeapController(RobotController):

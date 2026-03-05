@@ -36,3 +36,6 @@ MUJOCO_LOG.TXT
 # Misc
 *.bak
 *.tmp
+
+# Demo data (large HDF5 files)
+data/*.h5
