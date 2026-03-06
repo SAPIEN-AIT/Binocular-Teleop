@@ -1,0 +1,47 @@
+# configs/train_config.yaml
+# ─── Imitation Learning Training Config ─────────────────────────────────────
+
+data:
+  demo_dir: "data"             # folder with *.h5 demos
+  val_ratio: 0.1               # fraction held out for validation
+  num_workers: 0               # DataLoader workers (0 = main thread)
+
+policy: "bc"                   # "bc" or "act"
+
+# ── BC-specific ──────────────────────────────────────────────────────────────
+bc:
+  hidden: [256, 256]
+  dropout: 0.0
+
+# ── ACT-specific ─────────────────────────────────────────────────────────────
+act:
+  chunk_size: 10               # number of future actions predicted at once
+  d_model: 256
+  n_heads: 4
+  enc_layers: 2
+  dec_layers: 4
+  latent_dim: 32
+  kl_weight: 10.0
+
+# ── Optimisation ─────────────────────────────────────────────────────────────
+training:
+  epochs: 300
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  lr_schedule: "cosine"        # "cosine" or "none"
+  warmup_epochs: 5
+  grad_clip: 1.0               # max gradient norm (0 = off)
+  seed: 42
+
+# ── Checkpoints / Logging ───────────────────────────────────────────────────
+output:
+  save_dir: "checkpoints"     # best + last model saved here
+  save_every: 50              # save a checkpoint every N epochs (0 = off)
+  log_every: 5                # print metrics every N epochs
+
+wandb:
+  enabled: false               # flip to true once wandb login is done
+  project: "binocular-teleop"
+  entity: null
+  tags: []

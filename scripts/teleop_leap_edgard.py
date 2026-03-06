@@ -33,7 +33,7 @@ from vision.camera                       import ZEDCamera
 from vision.detectors                    import StereoHandTracker
 import vision.geometry                   as geo
 from vision.smoother                     import OneEuroFilter
-from robots.leap_hand.ik_retargeting     import IKRetargeter, palm_quat
+from src.robots.leap_hand.retargeter          import IKRetargeter, palm_quat
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 0       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -520,7 +520,7 @@ def main():
     # NOT mujoco — avoids the Cocoa / OpenGL conflict with mjpython on macOS).
     viewer_proc = None
     if SHOW_CAMERA:
-        from _camera_viewer import viewer_loop
+        from vision._camera_viewer import viewer_loop
         ctx = _mp.get_context("spawn")
         _frame_q = ctx.Queue(maxsize=2)
         _reset_flag = ctx.Value('i', 0)
